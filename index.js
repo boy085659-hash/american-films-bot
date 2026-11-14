@@ -1,39 +1,82 @@
 
 const { Telegraf } = require("telegraf");
-const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 
-// Check environment variables
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const TMDB_KEY = process.env.TMDB_API_KEY;
+const CHANNEL = "@VEXORAMOVIES";
 
 if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN is missing in Environment Variables");
-}
-
-if (!TMDB_KEY) {
-  throw new Error("TMDB_API_KEY is missing in Environment Variables");
+  throw new Error("BOT_TOKEN is missing");
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// TMDB API request
-const tmdb = axios.create({
-  baseURL: "https://api.themoviedb.org/3",
-  timeout: 15000,
-  params: {
-    api_key: TMDB_KEY
-  }
-});
+// Local movie database
+const DB_FILE = path.join(__dirname, "movies.json");
 
-// Welcome message
+let movies = [];
+
+try {
+  if (fs.existsSync(DB_FILE)) {
+    movies = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+  }
+} catch (error) {
+  console.error("Database error:", error.message);
+}
+
+function saveMovies() {
+  fs.writeFileSync(DB_FILE, JSON.stringify(movies, null, 2));
+}
+
+// Welcome
 bot.start((ctx) => {
   return ctx.reply(
     "🎬 Ku soo dhowow American Films!\n\n" +
-    "Ii soo qor magaca filimka aad rabto inaan kuu raadiyo."
+    "Ii soo qor magaca filimka aad rabto.\n\n" +
+    "Waxaan kuu soo dirayaa filimada ku jira channel-keena."
   );
 });
 
-// Search movies
+// Receive new channel videos and index them
+bot.on("channel_post", async (ctx) => {
+  try {
+    const post = ctx.channelPost;
+
+    // Only index actual video files
+    if (!post.video) return;
+
+    const title = post.caption?.trim();
+
+    if (!title) {
+      console.log("Video has no caption. Add its movie title.");
+      return;
+    }
+
+    const film = {
+      title,
+      chatId: ctx.chat.id,
+      messageId: post.message_id
+    };
+
+    // Avoid duplicate message entries
+    movies = movies.filter(
+      (m) =>
+        !(m.chatId === film.chatId &&
+          m.messageId === film.messageId)
+    );
+
+    movies.push(film);
+    saveMovies();
+
+    console.log("Movie indexed:", title);
+
+  } catch (error) {
+    console.error("INDEX ERROR:", error.message);
+  }
+});
+
+// Search channel movies
 bot.on("text", async (ctx) => {
   const query = ctx.message.text.trim();
 
@@ -42,34 +85,26 @@ bot.on("text", async (ctx) => {
   try {
     await ctx.sendChatAction("typing");
 
-    const response = await tmdb.get("/search/movie", {
-      params: {
-        query,
-        language: "en-US"
-      }
-    });
+    const found = movies
+      .filter((movie) =>
+        movie.title.toLowerCase().includes(query.toLowerCase())
+      )
+      .slice(0, 10);
 
-    const movies = (response.data.results || []).slice(0, 5);
-
-    if (movies.length === 0) {
+    if (found.length === 0) {
       return ctx.reply(
-        "❌ Filimkan lama helin. Isku day magac kale."
+        "❌ Filimkan channel-keena kuma jiro.\n\n" +
+        "Fadlan isku day magac kale."
       );
     }
 
-    const buttons = movies.map((movie) => {
-      const year = movie.release_date
-        ? movie.release_date.slice(0, 4)
-        : "Unknown";
-
-      return [{
-        text: `${movie.title} (${year})`,
-        callback_data: `movie:${movie.id}`
-      }];
-    });
+    const buttons = found.map((movie, index) => [{
+      text: `🎬 ${movie.title}`,
+      callback_data: `film:${index}`
+    }]);
 
     return ctx.reply(
-      "🎥 Filimada la helay. Mid dooro:",
+      "🎥 Filimada channel-ka laga helay. Mid dooro:",
       {
         reply_markup: {
           inline_keyboard: buttons
@@ -78,81 +113,50 @@ bot.on("text", async (ctx) => {
     );
 
   } catch (error) {
-    console.error(
-      "TMDB SEARCH ERROR:",
-      error.response?.data || error.message
-    );
-
-    return ctx.reply(
-      "⚠️ Raadinta filimka way fashilantay. Fadlan mar kale isku day."
-    );
+    console.error("SEARCH ERROR:", error.message);
+    return ctx.reply("⚠️ Raadinta ayaa fashilantay.");
   }
 });
 
-// Movie details
-bot.action(/^movie:(\d+)$/, async (ctx) => {
+// Send the actual channel video
+bot.action(/^film:(\d+)$/, async (ctx) => {
   try {
     await ctx.answerCbQuery();
-    await ctx.sendChatAction("typing");
 
-    const id = ctx.match[1];
+    const index = Number(ctx.match[1]);
+    const film = movies[index];
 
-    const response = await tmdb.get(`/movie/${id}`, {
-      params: {
-        language: "en-US"
-      }
-    });
-
-    const movie = response.data;
-
-    const year = movie.release_date
-      ? movie.release_date.slice(0, 4)
-      : "Unknown";
-
-    const rating = movie.vote_average
-      ? movie.vote_average.toFixed(1) + "/10"
-      : "Not available";
-
-    const overview =
-      movie.overview || "Faahfaahin lama hayo.";
-
-    const caption =
-      `🎬 ${movie.title}\n` +
-      `📅 Sanadka: ${year}\n` +
-      `⭐ Qiimeynta: ${rating}\n\n` +
-      `${overview.slice(0, 700)}\n\n` +
-      `📚 Xogta: TMDB`;
-
-    if (movie.poster_path) {
-      await ctx.replyWithPhoto(
-        `https://image.tmdb.org/t/p/w500${movie.poster_path}`,
-        { caption }
-      );
-    } else {
-      await ctx.reply(caption);
+    if (!film) {
+      return ctx.reply("❌ Filimkan lama helin.");
     }
 
-  } catch (error) {
-    console.error(
-      "MOVIE DETAILS ERROR:",
-      error.response?.data || error.message
+    await ctx.sendChatAction("upload_video");
+
+    await ctx.telegram.copyMessage(
+      ctx.chat.id,
+      film.chatId,
+      film.messageId
     );
 
-    return ctx.reply(
-      "⚠️ Faahfaahinta filimka lama soo heli karin."
+  } catch (error) {
+    console.error("SEND VIDEO ERROR:", error.message);
+
+    await ctx.reply(
+      "⚠️ Video-ga lama soo diri karin. Fadlan mar kale isku day."
     );
   }
 });
 
-// Error handling
+// Errors
 bot.catch((error) => {
   console.error("BOT ERROR:", error);
 });
 
-// Start bot
+// Launch
 bot.launch()
   .then(() => {
     console.log("🎬 American Films Bot is running!");
+    console.log("Indexed movies:", movies.length);
   })
   .catch((error) => {
     console.error("BOT START ERROR:", error);
