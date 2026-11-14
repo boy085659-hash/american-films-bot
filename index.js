@@ -10,11 +10,14 @@ const ADMIN_ID = 7199419196;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
 
 const bot = new Telegraf(BOT_TOKEN);
+
 const DB = path.join(__dirname, "movies.json");
+const USERS_DB = path.join(__dirname, "users.json");
 
 let movies = [];
-const complaints = new Set();
+let users = [];
 
+// Load movie database
 if (fs.existsSync(DB)) {
   try {
     movies = JSON.parse(fs.readFileSync(DB, "utf8"));
@@ -23,9 +26,102 @@ if (fs.existsSync(DB)) {
   }
 }
 
+// Load users database
+if (fs.existsSync(USERS_DB)) {
+  try {
+    users = JSON.parse(fs.readFileSync(USERS_DB, "utf8"));
+  } catch {
+    users = [];
+  }
+}
+
 function save() {
   fs.writeFileSync(DB, JSON.stringify(movies, null, 2));
 }
+
+function saveUsers() {
+  fs.writeFileSync(
+    USERS_DB,
+    JSON.stringify(users, null, 2)
+  );
+}
+
+// Register private bot users
+bot.use(async (ctx, next) => {
+  if (ctx.from && ctx.chat?.type === "private") {
+    if (!users.includes(ctx.from.id)) {
+      users.push(ctx.from.id);
+      saveUsers();
+      console.log("New user:", ctx.from.id);
+    }
+  }
+
+  return next();
+});
+
+// ADMIN BROADCAST
+bot.command("broadcast", async ctx => {
+  if (ctx.from.id !== ADMIN_ID) {
+    return ctx.reply("❌ Admin kaliya ayaa isticmaali kara.");
+  }
+
+  const message = ctx.message.text
+    .replace(/^\/broadcast(?:@\w+)?\s*/i, "")
+    .trim();
+
+  if (!message) {
+    return ctx.reply(
+      "📢 Isticmaal:\n\n/broadcast Fariintaada"
+    );
+  }
+
+  await ctx.reply("⏳ Fariinta waa la dirayaa...");
+
+  let sent = 0;
+  let failed = 0;
+  const activeUsers = [];
+
+  for (const userId of users) {
+    try {
+      await bot.telegram.sendMessage(userId, message);
+      sent++;
+      activeUsers.push(userId);
+    } catch (error) {
+      failed++;
+      console.log(
+        "Broadcast failed:",
+        userId,
+        error.message
+      );
+
+      // Keep users who may temporarily have delivery errors
+      activeUsers.push(userId);
+    }
+  }
+
+  users = activeUsers;
+  saveUsers();
+
+  return ctx.reply(
+    "✅ BROADCAST DHAMMAAD\n\n" +
+    "📨 La diray: " + sent + "\n" +
+    "⚠️ Fashilmay: " + failed + "\n" +
+    "👥 Wadarta: " + users.length
+  );
+});
+
+// ADMIN STATS
+bot.command("stats", ctx => {
+  if (ctx.from.id !== ADMIN_ID) {
+    return ctx.reply("❌ Admin kaliya.");
+  }
+
+  return ctx.reply(
+    "📊 AMERICAN FILMS STATISTICS\n\n" +
+    "🎬 Filimada kaydsan: " + movies.length + "\n" +
+    "👥 Dadka bot-ka isticmaalay: " + users.length
+  );
+});
 
 // Save new channel videos
 bot.on("channel_post", (ctx) => {
@@ -61,92 +157,15 @@ bot.on("channel_post", (ctx) => {
 bot.start(ctx => ctx.reply(
   "🎬 Ku soo dhowow American Films!\n\n" +
   "Qor magaca filimka aad rabto.\n\n" +
-  "Ama dooro:",
-  {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🎬 Raadi Filim", callback_data: "search_info" }],
-        [{ text: "📩 Cabasho / Nala soo xiriir", callback_data: "contact_admin" }],
-        [{ text: "ℹ️ Caawimaad", callback_data: "help" }]
-      ]
-    }
-  }
+  "📩 Cabasho ama caawimaad: nala soo xiriir."
 ));
 
-// Help
-bot.action("help", async ctx => {
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    "ℹ️ Sida loo isticmaalo:\n\n" +
-    "1. Qor magaca filimka.\n" +
-    "2. Dooro filimka aad rabto.\n" +
-    "3. Cabasho haddii aad qabto, nala soo xiriir.\n\n" +
-    "Qor /cancel si aad u joojiso cabashada."
-  );
-});
-
-// Search information
-bot.action("search_info", async ctx => {
-  await ctx.answerCbQuery();
-  await ctx.reply("🎬 Qor magaca filimka aad rabto.");
-});
-
-// Complaint button
-bot.action("contact_admin", async ctx => {
-  await ctx.answerCbQuery();
-  complaints.add(ctx.from.id);
-
-  await ctx.reply(
-    "📩 Fadlan halkan ku qor cabashadaada.\n\n" +
-    "Cabashadaada waxaa si gaar ah loogu dirayaa maamulka.\n\n" +
-    "Qor /cancel si aad u joojiso."
-  );
-});
-
-// Cancel complaint
-bot.command("cancel", ctx => {
-  complaints.delete(ctx.from.id);
-  return ctx.reply("❌ Cabashada waa la joojiyey.");
-});
-
-// Search and complaint messages
+// Search channel database only
 bot.on("text", async ctx => {
   const query = ctx.message.text.trim();
-  const userId = ctx.from.id;
 
   if (!query || query.startsWith("/")) return;
 
-  // Complaint system
-  if (complaints.has(userId)) {
-    complaints.delete(userId);
-
-    const username = ctx.from.username
-      ? "@" + ctx.from.username
-      : "Username ma jiro";
-
-    const complaint =
-      "📩 CABASHO CUSUB\n\n" +
-      "👤 Magac: " + (ctx.from.first_name || "Unknown") + "\n" +
-      "🔗 Username: " + username + "\n" +
-      "🆔 User ID: " + userId + "\n\n" +
-      "💬 Cabasho:\n" + query.slice(0, 3500);
-
-    try {
-      await bot.telegram.sendMessage(ADMIN_ID, complaint);
-
-      return ctx.reply(
-        "✅ Cabashadaada waa la helay.\n" +
-        "Mahadsanid inaad nala soo xiriirtay."
-      );
-    } catch (error) {
-      console.error("ADMIN MESSAGE ERROR:", error.message);
-      return ctx.reply(
-        "⚠️ Cabashada lama diri karin. Fadlan mar kale isku day."
-      );
-    }
-  }
-
-  // Search channel database only
   const results = movies.filter(m =>
     m.title.toLowerCase().includes(query.toLowerCase())
   ).slice(0, 10);
@@ -159,7 +178,7 @@ bot.on("text", async ctx => {
 
   const keyboard = results.map(movie => [{
     text: "🎬 " + movie.title,
-    callback_data: "film:" + movie.chatId + ":" + movie.messageId
+    callback_data: "film:" + movie.messageId
   }]);
 
   return ctx.reply(
@@ -173,14 +192,12 @@ bot.on("text", async ctx => {
 });
 
 // Send actual video from channel
-bot.action(/^film:(-?\d+):(\d+)$/, async ctx => {
+bot.action(/^film:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
 
-  const chatId = Number(ctx.match[1]);
-  const messageId = Number(ctx.match[2]);
+  const messageId = Number(ctx.match[1]);
 
   const movie = movies.find(m =>
-    m.chatId === chatId &&
     m.messageId === messageId
   );
 
