@@ -46,7 +46,8 @@ function loadArray(file, property) {
   }
 
   throw new Error(
-    "Database format is not recognized: " + path.basename(file) +
+    "Database format is not recognized: " +
+    path.basename(file) +
     ". Original file has not been overwritten."
   );
 }
@@ -66,7 +67,7 @@ function safeSave(file, data) {
 let movies = loadArray(MOVIES_DB, "movies");
 let users = loadArray(USERS_DB, "users");
 
-// Preserve old user IDs and dates.
+// Preserve old users and their existing fields.
 users = users.map(user => {
   if (typeof user === "number" || typeof user === "string") {
     return {
@@ -82,7 +83,7 @@ users = users.map(user => {
   };
 }).filter(user => Number.isFinite(user.id));
 
-// Preserve old movie records and all their existing fields.
+// Preserve all old movie records.
 let nextMovieId = movies.reduce(
   (max, movie) => Math.max(max, Number(movie.id) || 0),
   0
@@ -98,11 +99,10 @@ function saveUsers() {
   safeSave(USERS_DB, users);
 }
 
-// Save the compatible user format without removing old users.
 saveUsers();
 
 // ========================================
-// 3. MOVIE TITLE READER
+// 3. NORMALIZE AND CLEAN MOVIE TITLES
 // ========================================
 
 function normalize(value) {
@@ -122,6 +122,7 @@ function parseCaption(caption) {
   let episode = null;
   let part = null;
 
+  // Detect Season and Episode.
   let match = title.match(
     /\b(?:season|s)\s*0*(\d+)\s*(?:episode|ep|e)\s*0*(\d+)\b/i
   );
@@ -136,6 +137,7 @@ function parseCaption(caption) {
     title = title.replace(match[0], " ");
   }
 
+  // Detect movie parts.
   if (season === null) {
     const partMatch = title.match(
       /\b(?:part|pt|qayb|cd|disc|disk)\s*0*(\d+)\b/i
@@ -147,11 +149,37 @@ function parseCaption(caption) {
     }
   }
 
+  // Remove video file extensions.
+  title = title.replace(
+    /\.(mp4|mkv|avi|mov|webm)$/i,
+    " "
+  );
+
+  // Remove promotional words and channel branding.
+  title = title.replace(
+    /\b(?:filim|film|movie|cusub|new|official|astaan)\b/gi,
+    " "
+  );
+
+  // Remove video quality labels.
+  title = title.replace(
+    /\b(?:480p|720p|1080p|1440p|2160p|4k|8k|hd|full\s*hd|uhd|hdr|web-dl|bluray|brrip|webrip)\b/gi,
+    " "
+  );
+
+  // Remove years.
+  title = title.replace(/\b(?:19|20)\d{2}\b/g, " ");
+
+  // Remove emojis and flags.
+  title = title.replace(
+    /[\p{Extended_Pictographic}\p{Regional_Indicator}]/gu,
+    " "
+  );
+
+  // Remove punctuation and decorative symbols.
+  title = title.replace(/[^\p{L}\p{N}\s]/gu, " ");
+
   title = title
-    .replace(/\.(mp4|mkv|avi|mov|webm)$/i, " ")
-    .replace(/\b(480p|720p|1080p|2160p|4k|hd|full hd)\b/gi, " ")
-    .replace(/[\[\](){}]/g, " ")
-    .replace(/[|_]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -169,22 +197,46 @@ function parseCaption(caption) {
   };
 }
 
-// Read metadata from old records without deleting their fields.
+// Re-read old records using their original captions.
+// New cleaned title takes priority over old promotional title.
 function getMovieInfo(movie) {
   const source = movie.caption || movie.title || "";
   const parsed = parseCaption(source);
 
+  const oldSeason = movie.season !== undefined &&
+    movie.season !== null
+      ? Number(movie.season)
+      : null;
+
+  const oldEpisode = movie.episode !== undefined &&
+    movie.episode !== null
+      ? Number(movie.episode)
+      : null;
+
+  const oldPart = movie.part !== undefined &&
+    movie.part !== null
+      ? Number(movie.part)
+      : null;
+
+  const season = parsed.season ?? oldSeason;
+  const episode = parsed.episode ?? oldEpisode;
+  const part = parsed.part ?? oldPart;
+
   return {
-    title: movie.title || parsed.title,
-    key: movie.key || parsed.key,
-    season: movie.season ?? parsed.season,
-    episode: movie.episode ?? parsed.episode,
-    part: movie.part ?? parsed.part,
-    type: movie.type || parsed.type
+    title: parsed.title || parseCaption(movie.title).title || movie.title,
+    key: parsed.key || normalize(movie.title) || normalize(movie.key),
+    season,
+    episode,
+    part,
+    type: season !== null
+      ? "series"
+      : part !== null
+        ? "part"
+        : (movie.type === "series" ? "series" : "movie")
   };
 }
 
-// Add IDs and metadata to old records, keeping their original fields.
+// Add missing IDs and metadata without removing old fields.
 let migrationChanged = false;
 
 for (const movie of movies) {
@@ -196,7 +248,11 @@ for (const movie of movies) {
   const info = getMovieInfo(movie);
 
   for (const [key, value] of Object.entries(info)) {
-    if (movie[key] === undefined || movie[key] === null) {
+    if (
+      value !== undefined &&
+      value !== null &&
+      movie[key] !== value
+    ) {
       movie[key] = value;
       migrationChanged = true;
     }
@@ -215,7 +271,9 @@ bot.use(async (ctx, next) => {
   if (ctx.chat?.type === "private" && ctx.from) {
     const userId = Number(ctx.from.id);
 
-    const existing = users.find(user => user.id === userId);
+    const existing = users.find(
+      user => user.id === userId
+    );
 
     if (!existing) {
       users.push({
@@ -238,12 +296,14 @@ bot.use(async (ctx, next) => {
 
 bot.on("channel_post", ctx => {
   const post = ctx.channelPost;
+
   const channelUsername = ctx.chat.username
     ? "@" + ctx.chat.username.toLowerCase()
     : "";
 
   const allowedChannel = CHANNELS.some(
-    channel => channel.username.toLowerCase() === channelUsername
+    channel =>
+      channel.username.toLowerCase() === channelUsername
   );
 
   if (!allowedChannel) return;
@@ -271,9 +331,12 @@ bot.on("channel_post", ctx => {
 
   const parsed = parseCaption(caption);
 
-  if (!parsed.key) return;
+  if (!parsed.key) {
+    console.log("Could not detect movie title:", caption);
+    return;
+  }
 
-  // Check whether this exact channel post was already saved.
+  // Avoid saving the same channel post twice.
   let movie = movies.find(item =>
     String(item.chatId) === String(ctx.chat.id) &&
     Number(item.messageId) === Number(post.message_id)
@@ -289,6 +352,7 @@ bot.on("channel_post", ctx => {
     movies.push(movie);
   }
 
+  // Keep original caption and save cleaned movie title.
   Object.assign(movie, {
     caption,
     title: parsed.title,
@@ -297,7 +361,8 @@ bot.on("channel_post", ctx => {
     episode: parsed.episode,
     part: parsed.part,
     type: parsed.type,
-    sourceChannel: channelUsername
+    sourceChannel: channelUsername,
+    savedAt: movie.savedAt || new Date().toISOString()
   });
 
   saveMovies();
@@ -349,10 +414,16 @@ async function showJoin(ctx) {
     "2️⃣ " + CHANNELS[1].link,
     Markup.inlineKeyboard([
       [
-        Markup.button.url("📢 Somali Film", CHANNELS[1].link)
+        Markup.button.url(
+          "📢 Somali Film",
+          CHANNELS[1].link
+        )
       ],
       [
-        Markup.button.url("🎬 VEXORA MOVIES", CHANNELS[0].link)
+        Markup.button.url(
+          "🎬 VEXORA MOVIES",
+          CHANNELS[0].link
+        )
       ],
       [
         Markup.button.callback(
@@ -456,6 +527,7 @@ function similarity(a, b) {
 
 function findMovies(query) {
   const q = parseCaption(query).key || normalize(query);
+
   const groups = new Map();
 
   for (const movie of movies) {
@@ -490,13 +562,15 @@ function findMovies(query) {
 }
 
 // ========================================
-// 9. SEND VIDEO
+// 9. SEND VIDEO DIRECTLY
 // ========================================
 
 async function sendVideo(ctx, movie) {
   try {
     await ctx.sendChatAction("upload_video");
 
+    // Sends the original video directly.
+    // It does not create a folder or playlist.
     await ctx.telegram.copyMessage(
       ctx.chat.id,
       movie.chatId,
@@ -507,7 +581,8 @@ async function sendVideo(ctx, movie) {
     console.error("VIDEO ERROR:", error.message);
 
     await ctx.reply(
-      "⚠️ Video-ga lama soo diri karin. Fadlan mar kale isku day."
+      "⚠️ Video-ga lama soo diri karin.\n" +
+      "Fadlan mar kale isku day."
     );
   }
 }
@@ -520,17 +595,15 @@ async function openMovie(ctx, group) {
   const records = group.records;
 
   const episodes = records.filter(movie =>
-    movie.type === "series" &&
     movie.season !== null &&
     movie.episode !== null
   );
 
   const parts = records.filter(movie =>
-    movie.type === "part" &&
     movie.part !== null
   );
 
-  // TV SERIES
+  // TV SERIES: show Seasons.
   if (episodes.length) {
     const seasons = [
       ...new Set(episodes.map(movie => movie.season))
@@ -555,7 +628,7 @@ async function openMovie(ctx, group) {
     );
   }
 
-  // MOVIE PARTS
+  // MOVIE PARTS: show Parts.
   if (parts.length) {
     sessions.set(ctx.from.id, {
       type: "parts",
@@ -577,28 +650,12 @@ async function openMovie(ctx, group) {
     );
   }
 
-  // ONE MOVIE
-  if (records.length === 1) {
-    return sendVideo(ctx, records[0]);
-  }
+  // ONE MOVIE OR DUPLICATE COPIES:
+  // Always send a video directly.
+  // Never show a folder or copies menu.
+  const selectedMovie = records[records.length - 1];
 
-  // SAME TITLE FROM DIFFERENT CHANNELS OR COPIES
-  sessions.set(ctx.from.id, {
-    type: "copies",
-    records
-  });
-
-  return ctx.reply(
-    "🎬 Nuqullo kala duwan ayaa la helay. Mid dooro:",
-    Markup.inlineKeyboard(
-      records.slice(0, 10).map((movie, index) => [
-        Markup.button.callback(
-          "Nuqul " + (index + 1),
-          "copy:" + movie.id
-        )
-      ])
-    )
-  );
+  return sendVideo(ctx, selectedMovie);
 }
 
 // ========================================
@@ -607,7 +664,9 @@ async function openMovie(ctx, group) {
 
 bot.command("broadcast", async ctx => {
   if (ctx.from.id !== ADMIN_ID) {
-    return ctx.reply("❌ Admin keliya ayaa isticmaali kara.");
+    return ctx.reply(
+      "❌ Admin keliya ayaa isticmaali kara."
+    );
   }
 
   const replied = ctx.message.reply_to_message;
@@ -696,10 +755,26 @@ bot.command("stats", async ctx => {
     1
   ));
 
+  // Users registered last month.
   const lastMonthUsers = users.filter(user => {
     if (!user.firstSeen) return false;
 
     const date = new Date(user.firstSeen);
+
+    return (
+      !Number.isNaN(date.getTime()) &&
+      date >= startLastMonth &&
+      date < startThisMonth
+    );
+  }).length;
+
+  // Movies saved last month.
+  const lastMonthMovies = movies.filter(movie => {
+    const savedDate = movie.savedAt || movie.createdAt;
+
+    if (!savedDate) return false;
+
+    const date = new Date(savedDate);
 
     return (
       !Number.isNaN(date.getTime()) &&
@@ -731,10 +806,17 @@ bot.command("stats", async ctx => {
 
   return ctx.reply(
     "📊 AMERICAN FILMS STATISTICS\n\n" +
+
     "👥 ALL TIME USERS: " + users.length + "\n" +
-    "📅 LAST MONTH (" + monthName + "): " + lastMonthUsers + "\n" +
-    "❓ Old users without date: " + oldUsersWithoutDate + "\n\n" +
-    "🎬 TOTAL MOVIES: " + movies.length + "\n" +
+    "📅 LAST MONTH USERS (" + monthName + "): " +
+    lastMonthUsers + "\n" +
+
+    "❓ Old users without date: " +
+    oldUsersWithoutDate + "\n\n" +
+
+    "🎬 ALL TIME MOVIES: " + movies.length + "\n" +
+    "📅 LAST MONTH MOVIES: " + lastMonthMovies + "\n\n" +
+
     "📢 VEXORA MOVIES: " + channelOneMovies + "\n" +
     "📢 SOMALI FILM: " + channelTwoMovies
   );
@@ -798,7 +880,9 @@ bot.action(/^title:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== "titles") {
-    return ctx.reply("Fadlan mar kale raadi filimka.");
+    return ctx.reply(
+      "Fadlan mar kale raadi filimka."
+    );
   }
 
   const group = session.groups[Number(ctx.match[1])];
@@ -824,13 +908,15 @@ bot.action(/^season:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== "series") {
-    return ctx.reply("Fadlan mar kale raadi series-ka.");
+    return ctx.reply(
+      "Fadlan mar kale raadi series-ka."
+    );
   }
 
   const season = Number(ctx.match[1]);
 
   const episodes = session.episodes
-    .filter(movie => movie.season === season)
+    .filter(movie => Number(movie.season) === season)
     .sort((a, b) => a.episode - b.episode);
 
   if (!episodes.length) {
@@ -866,7 +952,9 @@ bot.action(/^episode:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== "series") {
-    return ctx.reply("Fadlan mar kale raadi series-ka.");
+    return ctx.reply(
+      "Fadlan mar kale raadi series-ka."
+    );
   }
 
   const movie = (session.selectedEpisodes || []).find(
@@ -894,7 +982,9 @@ bot.action(/^part:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== "parts") {
-    return ctx.reply("Fadlan mar kale raadi filimka.");
+    return ctx.reply(
+      "Fadlan mar kale raadi filimka."
+    );
   }
 
   const movie = session.records.find(
@@ -909,35 +999,7 @@ bot.action(/^part:(\d+)$/, async ctx => {
 });
 
 // ========================================
-// 18. SELECT COPY
-// ========================================
-
-bot.action(/^copy:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery();
-
-  if (!(await isJoined(ctx.from.id))) {
-    return showJoin(ctx);
-  }
-
-  const session = sessions.get(ctx.from.id);
-
-  if (!session || session.type !== "copies") {
-    return ctx.reply("Fadlan mar kale raadi filimka.");
-  }
-
-  const movie = session.records.find(
-    item => Number(item.id) === Number(ctx.match[1])
-  );
-
-  if (!movie) {
-    return ctx.reply("Filimka lama helin.");
-  }
-
-  return sendVideo(ctx, movie);
-});
-
-// ========================================
-// 19. ERROR HANDLING
+// 18. ERROR HANDLING
 // ========================================
 
 bot.catch(error => {
@@ -945,7 +1007,7 @@ bot.catch(error => {
 });
 
 // ========================================
-// 20. START BOT
+// 19. START BOT
 // ========================================
 
 bot.launch({
