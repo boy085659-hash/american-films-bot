@@ -3,115 +3,107 @@ const { Telegraf, Markup } = require("telegraf");
 const fs = require("fs");
 const path = require("path");
 
-// ==================================
-// SETTINGS
-// ==================================
+// ========================================
+// 1. SETTINGS
+// ========================================
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = 7199419196;
 
 const CHANNELS = [
   {
-    username: "@somalifilm0",
-    link: "https://t.me/somalifilm0"
-  },
-  {
     username: "@VEXORAMOVIES",
     link: "https://t.me/VEXORAMOVIES"
+  },
+  {
+    username: "@somalifilm0",
+    link: "https://t.me/somalifilm0"
   }
 ];
 
-if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
+if (!BOT_TOKEN) {
+  throw new Error("BOT_TOKEN missing");
+}
 
 const bot = new Telegraf(BOT_TOKEN);
 
-const DB = path.join(__dirname, "movies.json");
+const MOVIES_DB = path.join(__dirname, "movies.json");
 const USERS_DB = path.join(__dirname, "users.json");
 
-// ==================================
-// DATABASE
-// ==================================
+// ========================================
+// 2. SAFE DATABASE
+// ========================================
 
-let movies = [];
-let users = [];
+function loadArray(file, property) {
+  if (!fs.existsSync(file)) return [];
 
-if (fs.existsSync(DB)) {
-  try {
-    const data = JSON.parse(fs.readFileSync(DB, "utf8"));
-    if (Array.isArray(data)) movies = data;
-  } catch (e) {
-    console.error("MOVIES DB ERROR:", e.message);
+  const data = JSON.parse(fs.readFileSync(file, "utf8"));
+
+  if (Array.isArray(data)) return data;
+
+  if (data && Array.isArray(data[property])) {
+    return data[property];
   }
+
+  throw new Error(
+    "Database format is not recognized: " + path.basename(file) +
+    ". Original file has not been overwritten."
+  );
 }
 
-if (fs.existsSync(USERS_DB)) {
-  try {
-    const data = JSON.parse(fs.readFileSync(USERS_DB, "utf8"));
+function safeSave(file, data) {
+  const temp = file + ".tmp";
 
-    if (Array.isArray(data)) {
-      users = data.map(user => {
-        // Preserve old numeric user IDs.
-        if (typeof user === "number" || typeof user === "string") {
-          return {
-            id: Number(user),
-            firstSeen: null
-          };
-        }
+  fs.writeFileSync(
+    temp,
+    JSON.stringify(data, null, 2),
+    "utf8"
+  );
 
-        return {
-          id: Number(user.id),
-          firstSeen: user.firstSeen || null
-        };
-      }).filter(user => Number.isFinite(user.id));
-    }
-  } catch (e) {
-    console.error("USERS DB ERROR:", e.message);
+  fs.renameSync(temp, file);
+}
+
+let movies = loadArray(MOVIES_DB, "movies");
+let users = loadArray(USERS_DB, "users");
+
+// Preserve old user IDs and dates.
+users = users.map(user => {
+  if (typeof user === "number" || typeof user === "string") {
+    return {
+      id: Number(user),
+      firstSeen: null
+    };
   }
-}
 
-function saveMovies() {
-  fs.writeFileSync(DB, JSON.stringify(movies, null, 2));
-}
+  return {
+    ...user,
+    id: Number(user.id),
+    firstSeen: user.firstSeen || null
+  };
+}).filter(user => Number.isFinite(user.id));
 
-function saveUsers() {
-  fs.writeFileSync(USERS_DB, JSON.stringify(users, null, 2));
-}
-
-let nextId =
-  movies.reduce((max, m) => Math.max(max, Number(m.id) || 0), 0) + 1;
+// Preserve old movie records and all their existing fields.
+let nextMovieId = movies.reduce(
+  (max, movie) => Math.max(max, Number(movie.id) || 0),
+  0
+) + 1;
 
 const sessions = new Map();
 
-// Save converted old user records without deleting them.
+function saveMovies() {
+  safeSave(MOVIES_DB, movies);
+}
+
+function saveUsers() {
+  safeSave(USERS_DB, users);
+}
+
+// Save the compatible user format without removing old users.
 saveUsers();
 
-// ==================================
-// REGISTER USERS AND FIRST DATE
-// ==================================
-
-bot.use(async (ctx, next) => {
-  if (ctx.chat?.type === "private" && ctx.from) {
-    const userId = Number(ctx.from.id);
-
-    const existing = users.find(u => u.id === userId);
-
-    if (!existing) {
-      users.push({
-        id: userId,
-        firstSeen: new Date().toISOString()
-      });
-
-      saveUsers();
-      console.log("New user registered:", userId);
-    }
-  }
-
-  return next();
-});
-
-// ==================================
-// MOVIE TEXT READER
-// ==================================
+// ========================================
+// 3. MOVIE TITLE READER
+// ========================================
 
 function normalize(value) {
   return String(value || "")
@@ -177,12 +169,84 @@ function parseCaption(caption) {
   };
 }
 
-// ==================================
-// SAVE CHANNEL VIDEOS
-// ==================================
+// Read metadata from old records without deleting their fields.
+function getMovieInfo(movie) {
+  const source = movie.caption || movie.title || "";
+  const parsed = parseCaption(source);
+
+  return {
+    title: movie.title || parsed.title,
+    key: movie.key || parsed.key,
+    season: movie.season ?? parsed.season,
+    episode: movie.episode ?? parsed.episode,
+    part: movie.part ?? parsed.part,
+    type: movie.type || parsed.type
+  };
+}
+
+// Add IDs and metadata to old records, keeping their original fields.
+let migrationChanged = false;
+
+for (const movie of movies) {
+  if (!movie.id) {
+    movie.id = nextMovieId++;
+    migrationChanged = true;
+  }
+
+  const info = getMovieInfo(movie);
+
+  for (const [key, value] of Object.entries(info)) {
+    if (movie[key] === undefined || movie[key] === null) {
+      movie[key] = value;
+      migrationChanged = true;
+    }
+  }
+}
+
+if (migrationChanged) {
+  saveMovies();
+}
+
+// ========================================
+// 4. REGISTER USERS
+// ========================================
+
+bot.use(async (ctx, next) => {
+  if (ctx.chat?.type === "private" && ctx.from) {
+    const userId = Number(ctx.from.id);
+
+    const existing = users.find(user => user.id === userId);
+
+    if (!existing) {
+      users.push({
+        id: userId,
+        firstSeen: new Date().toISOString()
+      });
+
+      saveUsers();
+
+      console.log("New user registered:", userId);
+    }
+  }
+
+  return next();
+});
+
+// ========================================
+// 5. RECEIVE VIDEOS FROM BOTH CHANNELS
+// ========================================
 
 bot.on("channel_post", ctx => {
   const post = ctx.channelPost;
+  const channelUsername = ctx.chat.username
+    ? "@" + ctx.chat.username.toLowerCase()
+    : "";
+
+  const allowedChannel = CHANNELS.some(
+    channel => channel.username.toLowerCase() === channelUsername
+  );
+
+  if (!allowedChannel) return;
 
   const hasVideo =
     Boolean(post.video) ||
@@ -199,19 +263,25 @@ bot.on("channel_post", ctx => {
   if (!hasVideo) return;
 
   const caption = post.caption?.trim();
-  if (!caption) return;
+
+  if (!caption) {
+    console.log("Video has no caption:", post.message_id);
+    return;
+  }
 
   const parsed = parseCaption(caption);
+
   if (!parsed.key) return;
 
-  let movie = movies.find(m =>
-    String(m.chatId) === String(ctx.chat.id) &&
-    Number(m.messageId) === Number(post.message_id)
+  // Check whether this exact channel post was already saved.
+  let movie = movies.find(item =>
+    String(item.chatId) === String(ctx.chat.id) &&
+    Number(item.messageId) === Number(post.message_id)
   );
 
   if (!movie) {
     movie = {
-      id: nextId++,
+      id: nextMovieId++,
       chatId: ctx.chat.id,
       messageId: post.message_id
     };
@@ -226,39 +296,23 @@ bot.on("channel_post", ctx => {
     season: parsed.season,
     episode: parsed.episode,
     part: parsed.part,
-    type: parsed.type
+    type: parsed.type,
+    sourceChannel: channelUsername
   });
 
   saveMovies();
-  console.log("Saved movie:", parsed.title);
+
+  console.log(
+    "New movie saved:",
+    parsed.title,
+    "from",
+    channelUsername
+  );
 });
 
-// ==================================
-// PREPARE OLD MOVIES
-// ==================================
-
-let changed = false;
-
-for (const movie of movies) {
-  if (!movie.id) {
-    movie.id = nextId++;
-    changed = true;
-  }
-
-  if (!movie.key || !movie.type) {
-    Object.assign(
-      movie,
-      parseCaption(movie.caption || movie.title || "")
-    );
-    changed = true;
-  }
-}
-
-if (changed) saveMovies();
-
-// ==================================
-// SUBSCRIBE CHECK
-// ==================================
+// ========================================
+// 6. SUBSCRIBE CHECK
+// ========================================
 
 async function isJoined(userId) {
   for (const channel of CHANNELS) {
@@ -268,14 +322,19 @@ async function isJoined(userId) {
         userId
       );
 
-      if (
-        !["creator", "administrator", "member"].includes(member.status) &&
-        !(member.status === "restricted" && member.is_member)
-      ) {
-        return false;
-      }
-    } catch (e) {
-      console.error("JOIN CHECK ERROR:", e.message);
+      const joined =
+        ["creator", "administrator", "member"].includes(member.status) ||
+        (member.status === "restricted" && member.is_member);
+
+      if (!joined) return false;
+
+    } catch (error) {
+      console.error(
+        "JOIN CHECK ERROR:",
+        channel.username,
+        error.message
+      );
+
       return false;
     }
   }
@@ -285,42 +344,57 @@ async function isJoined(userId) {
 
 async function showJoin(ctx) {
   return ctx.reply(
-    "Fadlan join dheh channelada aad leftiga ka qaadatey 👇\n\n" +
-    "❌ " + CHANNELS[0].link + "\n" +
-    "❌ " + CHANNELS[1].link,
+    "🎬 Si aad u isticmaasho bot-ka, fadlan join garee labada channel:\n\n" +
+    "1️⃣ " + CHANNELS[0].link + "\n" +
+    "2️⃣ " + CHANNELS[1].link,
     Markup.inlineKeyboard([
-      [Markup.button.url("📢 Somali Film", CHANNELS[0].link)],
-      [Markup.button.url("🎬 VEXORA MOVIES", CHANNELS[1].link)],
-      [Markup.button.callback("✅ Waan join gareeyay", "check_join")]
+      [
+        Markup.button.url("📢 Somali Film", CHANNELS[1].link)
+      ],
+      [
+        Markup.button.url("🎬 VEXORA MOVIES", CHANNELS[0].link)
+      ],
+      [
+        Markup.button.callback(
+          "✅ Waan join gareeyay",
+          "check_join"
+        )
+      ]
     ])
   );
 }
 
-// ==================================
-// START AND JOIN BUTTON
-// ==================================
+// ========================================
+// 7. START
+// ========================================
 
 bot.start(async ctx => {
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   return ctx.reply(
-    "🎬 Ku soo dhowow American Films!\n\nQor magaca filimka aad rabto."
+    "🎬 Ku soo dhowow American Films!\n\n" +
+    "Qor magaca filimka aad rabto."
   );
 });
 
 bot.action("check_join", async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   return ctx.reply(
-    "✅ Waa lagu xaqiijiyay!\n\nQor magaca filimka."
+    "✅ Waa lagu xaqiijiyay!\n\n" +
+    "Hadda qor magaca filimka."
   );
 });
 
-// ==================================
-// SMART SEARCH
-// ==================================
+// ========================================
+// 8. SMART SEARCH
+// ========================================
 
 function distance(a, b) {
   const row = Array.from(
@@ -381,21 +455,28 @@ function similarity(a, b) {
 }
 
 function findMovies(query) {
-  const q = normalize(query);
+  const q = parseCaption(query).key || normalize(query);
   const groups = new Map();
 
   for (const movie of movies) {
-    if (!movie.key || !movie.chatId || !movie.messageId) continue;
+    if (!movie.chatId || !movie.messageId) continue;
 
-    if (!groups.has(movie.key)) {
-      groups.set(movie.key, {
-        title: movie.title,
-        key: movie.key,
+    const info = getMovieInfo(movie);
+
+    if (!info.key) continue;
+
+    if (!groups.has(info.key)) {
+      groups.set(info.key, {
+        title: info.title,
+        key: info.key,
         records: []
       });
     }
 
-    groups.get(movie.key).records.push(movie);
+    groups.get(info.key).records.push({
+      ...movie,
+      ...info
+    });
   }
 
   return [...groups.values()]
@@ -408,9 +489,9 @@ function findMovies(query) {
     .slice(0, 8);
 }
 
-// ==================================
-// SEND VIDEO
-// ==================================
+// ========================================
+// 9. SEND VIDEO
+// ========================================
 
 async function sendVideo(ctx, movie) {
   try {
@@ -421,32 +502,38 @@ async function sendVideo(ctx, movie) {
       movie.chatId,
       movie.messageId
     );
-  } catch (e) {
-    console.error("VIDEO ERROR:", e.message);
-    await ctx.reply("⚠️ Video-ga lama soo diri karin.");
+
+  } catch (error) {
+    console.error("VIDEO ERROR:", error.message);
+
+    await ctx.reply(
+      "⚠️ Video-ga lama soo diri karin. Fadlan mar kale isku day."
+    );
   }
 }
 
-// ==================================
-// OPEN MOVIE
-// ==================================
+// ========================================
+// 10. OPEN MOVIE / SERIES / PARTS
+// ========================================
 
 async function openMovie(ctx, group) {
   const records = group.records;
 
-  const episodes = records.filter(m =>
-    m.type === "series" &&
-    m.season !== null &&
-    m.episode !== null
+  const episodes = records.filter(movie =>
+    movie.type === "series" &&
+    movie.season !== null &&
+    movie.episode !== null
   );
 
-  const parts = records.filter(m =>
-    m.type === "part" && m.part !== null
+  const parts = records.filter(movie =>
+    movie.type === "part" &&
+    movie.part !== null
   );
 
+  // TV SERIES
   if (episodes.length) {
     const seasons = [
-      ...new Set(episodes.map(m => m.season))
+      ...new Set(episodes.map(movie => movie.season))
     ].sort((a, b) => a - b);
 
     sessions.set(ctx.from.id, {
@@ -456,15 +543,19 @@ async function openMovie(ctx, group) {
     });
 
     return ctx.reply(
-      "🎬 " + group.title + "\n\nDooro Season:",
+      "📺 " + group.title + "\n\nDooro Season:",
       Markup.inlineKeyboard(
-        seasons.map(s => [
-          Markup.button.callback("Season " + s, "season:" + s)
+        seasons.map(season => [
+          Markup.button.callback(
+            "Season " + season,
+            "season:" + season
+          )
         ])
       )
     );
   }
 
+  // MOVIE PARTS
   if (parts.length) {
     sessions.set(ctx.from.id, {
       type: "parts",
@@ -474,37 +565,45 @@ async function openMovie(ctx, group) {
     return ctx.reply(
       "🎬 " + group.title + "\n\nDooro qaybta:",
       Markup.inlineKeyboard(
-        parts.sort((a, b) => a.part - b.part).map(m => [
-          Markup.button.callback("Part " + m.part, "part:" + m.id)
-        ])
+        parts
+          .sort((a, b) => a.part - b.part)
+          .map(movie => [
+            Markup.button.callback(
+              "Part " + movie.part,
+              "part:" + movie.id
+            )
+          ])
       )
     );
   }
 
+  // ONE MOVIE
   if (records.length === 1) {
     return sendVideo(ctx, records[0]);
   }
 
+  // SAME TITLE FROM DIFFERENT CHANNELS OR COPIES
   sessions.set(ctx.from.id, {
     type: "copies",
     records
   });
 
   return ctx.reply(
-    "Filimkan nuqullo kala duwan ayaa jira. Mid dooro:",
+    "🎬 Nuqullo kala duwan ayaa la helay. Mid dooro:",
     Markup.inlineKeyboard(
-      records.slice(0, 10).map((m, i) => [
-        Markup.button.callback("Nuqul " + (i + 1), "copy:" + m.id)
+      records.slice(0, 10).map((movie, index) => [
+        Markup.button.callback(
+          "Nuqul " + (index + 1),
+          "copy:" + movie.id
+        )
       ])
     )
   );
 }
 
-// ==================================
-// ADMIN BROADCAST
-// ==================================
-
-// Register commands BEFORE the general text search handler.
+// ========================================
+// 11. ADMIN BROADCAST
+// ========================================
 
 bot.command("broadcast", async ctx => {
   if (ctx.from.id !== ADMIN_ID) {
@@ -519,8 +618,10 @@ bot.command("broadcast", async ctx => {
 
   if (!replied && !message) {
     return ctx.reply(
-      "📢 Qoraal:\n/broadcast Fariintaada\n\n" +
-      "Sawir ama video: Reply saar fariinta kadib qor /broadcast."
+      "📢 Qoraal:\n" +
+      "/broadcast Fariintaada\n\n" +
+      "Sawir ama video:\n" +
+      "Reply saar fariinta kadib qor /broadcast."
     );
   }
 
@@ -541,15 +642,26 @@ bot.command("broadcast", async ctx => {
           replied.message_id
         );
       } else {
-        await ctx.telegram.sendMessage(user.id, message);
+        await ctx.telegram.sendMessage(
+          user.id,
+          message
+        );
       }
 
       sent++;
-      await new Promise(resolve => setTimeout(resolve, 40));
 
-    } catch (e) {
+      await new Promise(resolve =>
+        setTimeout(resolve, 40)
+      );
+
+    } catch (error) {
       failed++;
-      console.log("BROADCAST ERROR:", user.id, e.message);
+
+      console.log(
+        "BROADCAST ERROR:",
+        user.id,
+        error.message
+      );
     }
   }
 
@@ -561,9 +673,9 @@ bot.command("broadcast", async ctx => {
   );
 });
 
-// ==================================
-// ADMIN STATISTICS
-// ==================================
+// ========================================
+// 12. ADMIN STATISTICS
+// ========================================
 
 bot.command("stats", async ctx => {
   if (ctx.from.id !== ADMIN_ID) {
@@ -572,7 +684,6 @@ bot.command("stats", async ctx => {
 
   const now = new Date();
 
-  // Previous calendar month in UTC.
   const startLastMonth = new Date(Date.UTC(
     now.getUTCFullYear(),
     now.getUTCMonth() - 1,
@@ -590,9 +701,11 @@ bot.command("stats", async ctx => {
 
     const date = new Date(user.firstSeen);
 
-    return !Number.isNaN(date.getTime()) &&
+    return (
+      !Number.isNaN(date.getTime()) &&
       date >= startLastMonth &&
-      date < startThisMonth;
+      date < startThisMonth
+    );
   }).length;
 
   const monthName = startLastMonth.toLocaleString(
@@ -604,22 +717,32 @@ bot.command("stats", async ctx => {
     }
   );
 
-  const unknownDates = users.filter(
+  const oldUsersWithoutDate = users.filter(
     user => !user.firstSeen
+  ).length;
+
+  const channelOneMovies = movies.filter(
+    movie => movie.sourceChannel === "@vexoramovies"
+  ).length;
+
+  const channelTwoMovies = movies.filter(
+    movie => movie.sourceChannel === "@somalifilm0"
   ).length;
 
   return ctx.reply(
     "📊 AMERICAN FILMS STATISTICS\n\n" +
     "👥 ALL TIME USERS: " + users.length + "\n" +
     "📅 LAST MONTH (" + monthName + "): " + lastMonthUsers + "\n" +
-    "❓ Old users without date: " + unknownDates + "\n" +
-    "🎬 TOTAL MOVIES: " + movies.length
+    "❓ Old users without date: " + oldUsersWithoutDate + "\n\n" +
+    "🎬 TOTAL MOVIES: " + movies.length + "\n" +
+    "📢 VEXORA MOVIES: " + channelOneMovies + "\n" +
+    "📢 SOMALI FILM: " + channelTwoMovies
   );
 });
 
-// ==================================
-// MOVIE SEARCH HANDLER
-// ==================================
+// ========================================
+// 13. SEARCH HANDLER
+// ========================================
 
 bot.on("text", async ctx => {
   const query = ctx.message.text.trim();
@@ -634,7 +757,8 @@ bot.on("text", async ctx => {
 
   if (!results.length) {
     return ctx.reply(
-      "❌ Filimkan lama helin.\n\nIsku day magac kale."
+      "❌ Filimkan lama helin.\n\n" +
+      "Isku day magac kale."
     );
   }
 
@@ -648,50 +772,65 @@ bot.on("text", async ctx => {
   });
 
   return ctx.reply(
-    "Filimadan ayaa isku dhow. Mid dooro:",
+    "🎬 Filimadan ayaa la helay. Mid dooro:",
     Markup.inlineKeyboard(
-      results.map((g, i) => [
-        Markup.button.callback(g.title, "title:" + i)
+      results.map((group, index) => [
+        Markup.button.callback(
+          group.title,
+          "title:" + index
+        )
       ])
     )
   );
 });
 
-// ==================================
-// SELECT TITLE
-// ==================================
+// ========================================
+// 14. SELECT MOVIE TITLE
+// ========================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   const session = sessions.get(ctx.from.id);
-  if (!session || session.type !== "titles") return;
+
+  if (!session || session.type !== "titles") {
+    return ctx.reply("Fadlan mar kale raadi filimka.");
+  }
 
   const group = session.groups[Number(ctx.match[1])];
 
-  if (!group) return ctx.reply("Filimka lama helin.");
+  if (!group) {
+    return ctx.reply("Filimka lama helin.");
+  }
 
   return openMovie(ctx, group);
 });
 
-// ==================================
-// SELECT SEASON
-// ==================================
+// ========================================
+// 15. SELECT SEASON
+// ========================================
 
 bot.action(/^season:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   const session = sessions.get(ctx.from.id);
-  if (!session || session.type !== "series") return;
+
+  if (!session || session.type !== "series") {
+    return ctx.reply("Fadlan mar kale raadi series-ka.");
+  }
 
   const season = Number(ctx.match[1]);
 
   const episodes = session.episodes
-    .filter(m => m.season === season)
+    .filter(movie => movie.season === season)
     .sort((a, b) => a.episode - b.episode);
 
   if (!episodes.length) {
@@ -703,87 +842,111 @@ bot.action(/^season:(\d+)$/, async ctx => {
   return ctx.reply(
     "📺 Season " + season + "\n\nDooro Episode:",
     Markup.inlineKeyboard(
-      episodes.map(m => [
-        Markup.button.callback("EP " + m.episode, "episode:" + m.id)
+      episodes.map(movie => [
+        Markup.button.callback(
+          "EP " + movie.episode,
+          "episode:" + movie.id
+        )
       ])
     )
   );
 });
 
-// ==================================
-// SELECT EPISODE
-// ==================================
+// ========================================
+// 16. SELECT EPISODE
+// ========================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   const session = sessions.get(ctx.from.id);
-  if (!session || session.type !== "series") return;
 
-  const movie = session.selectedEpisodes?.find(
-    m => Number(m.id) === Number(ctx.match[1])
+  if (!session || session.type !== "series") {
+    return ctx.reply("Fadlan mar kale raadi series-ka.");
+  }
+
+  const movie = (session.selectedEpisodes || []).find(
+    item => Number(item.id) === Number(ctx.match[1])
   );
 
-  if (!movie) return ctx.reply("Episode-kan lama helin.");
+  if (!movie) {
+    return ctx.reply("Episode-kan lama helin.");
+  }
 
   return sendVideo(ctx, movie);
 });
 
-// ==================================
-// SELECT PART
-// ==================================
+// ========================================
+// 17. SELECT PART
+// ========================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   const session = sessions.get(ctx.from.id);
-  if (!session || session.type !== "parts") return;
+
+  if (!session || session.type !== "parts") {
+    return ctx.reply("Fadlan mar kale raadi filimka.");
+  }
 
   const movie = session.records.find(
-    m => Number(m.id) === Number(ctx.match[1])
+    item => Number(item.id) === Number(ctx.match[1])
   );
 
-  if (!movie) return ctx.reply("Qaybtan lama helin.");
+  if (!movie) {
+    return ctx.reply("Qaybtan lama helin.");
+  }
 
   return sendVideo(ctx, movie);
 });
 
-// ==================================
-// SELECT DUPLICATE COPY
-// ==================================
+// ========================================
+// 18. SELECT COPY
+// ========================================
 
 bot.action(/^copy:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   const session = sessions.get(ctx.from.id);
-  if (!session || session.type !== "copies") return;
+
+  if (!session || session.type !== "copies") {
+    return ctx.reply("Fadlan mar kale raadi filimka.");
+  }
 
   const movie = session.records.find(
-    m => Number(m.id) === Number(ctx.match[1])
+    item => Number(item.id) === Number(ctx.match[1])
   );
 
-  if (!movie) return ctx.reply("Filimka lama helin.");
+  if (!movie) {
+    return ctx.reply("Filimka lama helin.");
+  }
 
   return sendVideo(ctx, movie);
 });
 
-// ==================================
-// ERROR HANDLING
-// ==================================
+// ========================================
+// 19. ERROR HANDLING
+// ========================================
 
-bot.catch(err => {
-  console.error("BOT ERROR:", err);
+bot.catch(error => {
+  console.error("BOT ERROR:", error);
 });
 
-// ==================================
-// START BOT
-// ==================================
+// ========================================
+// 20. START BOT
+// ========================================
 
 bot.launch({
   allowedUpdates: [
@@ -794,6 +957,7 @@ bot.launch({
 });
 
 console.log("🎬 American Films Bot is running!");
+console.log("📢 Listening to both movie channels.");
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
