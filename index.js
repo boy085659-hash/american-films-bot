@@ -98,7 +98,7 @@ function saveUsers() {
 saveUsers();
 
 // ========================================
-// 3. SMART TITLE CLEANER
+// 3. NORMALIZE
 // ========================================
 
 function normalize(value) {
@@ -111,51 +111,66 @@ function normalize(value) {
     .replace(/\s+/g, " ");
 }
 
+// ========================================
+// 4. SMART CAPTION PARSER
+// ========================================
+
 function parseCaption(caption) {
-  let title = String(caption || "").trim();
+  const raw = String(caption || "").trim();
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map(x => x.trim())
+    .filter(Boolean);
 
   let season = null;
   let episode = null;
   let part = null;
 
-  // Season 1 Episode 5 / S1E5
-  let match = title.match(
+  // Season 1 Episode 5 / S1E5 / 1x05
+  let match = raw.match(
     /\b(?:season|s)\s*0*(\d+)\s*(?:episode|ep|e)\s*0*(\d+)\b/i
   );
 
   if (!match) {
-    match = title.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+    match = raw.match(/\b(\d{1,2})x(\d{1,3})\b/i);
   }
 
   if (match) {
     season = Number(match[1]);
     episode = Number(match[2]);
-    title = title.replace(match[0], " ");
   }
 
-  // Episode 5
-  if (season === null) {
-    const epMatch = title.match(
-      /\b(?:episode|ep)\s*0*(\d+)\b/i
-    );
+  // Somali and English part names.
+  const partRegex =
+    /\b(?:part|pt|qeyb(?:ta|teda|teeda)?|qayb(?:ta|teda|teeda)?|qeyteda|qayteda|qeyted[a]?|qayted[a]?|cd|disc|disk)\s*[:#-]?\s*0*(\d+)\s*(?:aad|naad)?\b/i;
 
-    if (epMatch) {
-      episode = Number(epMatch[1]);
-      title = title.replace(epMatch[0], " ");
-    }
+  const partMatch = raw.match(partRegex);
+
+  if (partMatch && season === null) {
+    part = Number(partMatch[1]);
   }
 
-  // Part 5, Qeybta 5, Qeybta 5AAD
-  if (season === null) {
-    const partMatch = title.match(
-      /\b(?:part|pt|qeybta|qaybta|qeyb|qayb|cd|disc|disk)\s*0*(\d+)\s*(?:aad|naad)?\b/i
-    );
+  // Choose the first caption line as title.
+  let title = lines[0] || raw;
 
-    if (partMatch) {
-      part = Number(partMatch[1]);
-      title = title.replace(partMatch[0], " ");
-    }
+  // Remove part marker and everything after it.
+  const titlePart = title.match(partRegex);
+
+  if (titlePart && titlePart.index !== undefined) {
+    title = title.slice(0, titlePart.index);
   }
+
+  // Remove known promotional descriptions.
+  title = title.replace(
+    /\b(?:daraamadaan|ramadan|iyadoo|iyadoo|turjuman|telegram|dhigin|lama|soo)\b.*$/i,
+    " "
+  );
+
+  title = title.replace(
+    /\b(?:daraamadaan|ramadan)\b/gi,
+    " "
+  );
 
   // Remove hashtags.
   title = title.replace(/#[\w]+/g, " ");
@@ -172,7 +187,7 @@ function parseCaption(caption) {
     " "
   );
 
-  // Remove video quality.
+  // Remove quality labels.
   title = title.replace(
     /\b(?:480p|720p|1080p|1440p|2160p|4k|8k|hd|full\s*hd|uhd|hdr|web-dl|bluray|brrip|webrip)\b/gi,
     " "
@@ -181,15 +196,19 @@ function parseCaption(caption) {
   // Remove years.
   title = title.replace(/\b(?:19|20)\d{2}\b/g, " ");
 
-  // Remove emojis and flags.
+  // Remove season / episode labels.
+  title = title.replace(
+    /\b(?:season|episode|ep)\s*\d+\b/gi,
+    " "
+  );
+
+  // Remove emojis.
   title = title.replace(
     /[\p{Extended_Pictographic}\p{Regional_Indicator}]/gu,
     " "
   );
 
-  // Remove decorative punctuation.
   title = title.replace(/[^\p{L}\p{N}\s]/gu, " ");
-
   title = title.replace(/\s+/g, " ").trim();
 
   return {
@@ -207,7 +226,7 @@ function parseCaption(caption) {
 }
 
 // ========================================
-// 4. OLD MOVIE RECORD COMPATIBILITY
+// 5. READ OLD MOVIE RECORDS
 // ========================================
 
 function getMovieInfo(movie) {
@@ -230,26 +249,31 @@ function getMovieInfo(movie) {
   const episode = parsed.episode ?? oldEpisode;
   const part = parsed.part ?? oldPart;
 
+  const title =
+    parsed.title ||
+    parseCaption(movie.title).title ||
+    movie.title ||
+    "";
+
   return {
-    title: parsed.title ||
-      parseCaption(movie.title).title ||
-      movie.title,
-
-    key: parsed.key ||
-      normalize(movie.title) ||
-      normalize(movie.key),
-
+    title,
+    key: normalize(title),
     season,
     episode,
     part,
-
     type: season !== null
       ? "series"
       : part !== null
         ? "part"
-        : (movie.type === "series" ? "series" : "movie")
+        : movie.type === "series"
+          ? "series"
+          : "movie"
   };
 }
+
+// ========================================
+// 6. MIGRATE OLD MOVIE METADATA
+// ========================================
 
 let migrationChanged = false;
 
@@ -273,10 +297,12 @@ for (const movie of movies) {
   }
 }
 
-if (migrationChanged) saveMovies();
+if (migrationChanged) {
+  saveMovies();
+}
 
 // ========================================
-// 5. REGISTER USERS
+// 7. REGISTER USERS
 // ========================================
 
 bot.use(async (ctx, next) => {
@@ -303,7 +329,7 @@ bot.use(async (ctx, next) => {
 });
 
 // ========================================
-// 6. RECEIVE VIDEOS FROM CHANNELS
+// 8. RECEIVE CHANNEL VIDEOS
 // ========================================
 
 bot.on("channel_post", ctx => {
@@ -386,7 +412,7 @@ bot.on("channel_post", ctx => {
 });
 
 // ========================================
-// 7. SUBSCRIBE CHECK
+// 9. SUBSCRIBE CHECK
 // ========================================
 
 async function isJoined(userId) {
@@ -404,7 +430,7 @@ async function isJoined(userId) {
       if (!joined) return false;
 
     } catch (error) {
-      console.error("JOIN CHECK:", error.message);
+      console.error("JOIN CHECK:", channel.username, error.message);
       return false;
     }
   }
@@ -433,7 +459,7 @@ async function showJoin(ctx) {
 }
 
 // ========================================
-// 8. START
+// 10. START
 // ========================================
 
 bot.start(async ctx => {
@@ -443,8 +469,7 @@ bot.start(async ctx => {
 
   return ctx.reply(
     "🎬 Ku soo dhowow American Films!\n\n" +
-    "Qor magaca filimka aad rabto.\n\n" +
-    "Tusaale: Sweet Home"
+    "Qor magaca filimka aad rabto."
   );
 });
 
@@ -456,12 +481,12 @@ bot.action("check_join", async ctx => {
   }
 
   return ctx.reply(
-    "✅ Waa lagu xaqiijiyay!\n\nQor magaca filimka."
+    "✅ Waa lagu xaqiijiyay!\n\nHadda qor magaca filimka."
   );
 });
 
 // ========================================
-// 9. SMART FUZZY SEARCH
+// 11. FUZZY SEARCH
 // ========================================
 
 function distance(a, b) {
@@ -494,18 +519,16 @@ function wordSimilarity(a, b) {
   if (!a || !b) return 0;
   if (a === b) return 1;
 
-  return 1 - (
-    distance(a, b) / Math.max(a.length, b.length)
-  );
+  return 1 -
+    distance(a, b) / Math.max(a.length, b.length);
 }
 
 function similarity(query, title) {
   if (!query || !title) return 0;
   if (query === title) return 1;
 
-  // Exact phrase inside title.
-  if (title.includes(query)) return 0.96;
-  if (query.includes(title)) return 0.93;
+  if (title.includes(query)) return 0.97;
+  if (query.includes(title)) return 0.94;
 
   const queryWords = query.split(" ");
   const titleWords = title.split(" ");
@@ -514,27 +537,26 @@ function similarity(query, title) {
     let best = 0;
 
     for (const other of titleWords) {
-      best = Math.max(
-        best,
-        wordSimilarity(word, other)
-      );
+      best = Math.max(best, wordSimilarity(word, other));
     }
 
     return best;
   });
 
   const average =
-    matched.reduce((sum, score) => sum + score, 0) /
+    matched.reduce((sum, value) => sum + value, 0) /
     matched.length;
 
-  const allWordsMatch = matched.every(score => score >= 0.72);
+  const allMatch = matched.every(value => value >= 0.72);
 
-  if (allWordsMatch) {
-    return Math.min(0.92, average);
-  }
+  if (allMatch) return Math.min(0.92, average);
 
   return average * 0.85;
 }
+
+// ========================================
+// 12. GROUP MOVIES BY ONE TITLE
+// ========================================
 
 function findMovies(query) {
   const parsedQuery = parseCaption(query);
@@ -567,12 +589,10 @@ function findMovies(query) {
       ...group,
       score: similarity(q, group.key)
     }))
-    .filter(group => group.score >= (
-      q.split(" ").length === 1 ? 0.72 : 0.68
-    ));
+    .filter(group =>
+      group.score >= (q.split(" ").length === 1 ? 0.72 : 0.68)
+    );
 
-  // If a specific part was requested,
-  // prefer titles that contain that part.
   if (parsedQuery.part !== null) {
     const matching = results.filter(group =>
       group.records.some(
@@ -583,16 +603,14 @@ function findMovies(query) {
     if (matching.length) results = matching;
   }
 
-  if (
-    parsedQuery.season !== null ||
-    parsedQuery.episode !== null
-  ) {
+  if (parsedQuery.episode !== null) {
     const matching = results.filter(group =>
       group.records.some(movie =>
-        (parsedQuery.season === null ||
-          Number(movie.season) === parsedQuery.season) &&
-        (parsedQuery.episode === null ||
-          Number(movie.episode) === parsedQuery.episode)
+        Number(movie.episode) === parsedQuery.episode &&
+        (
+          parsedQuery.season === null ||
+          Number(movie.season) === parsedQuery.season
+        )
       )
     );
 
@@ -605,7 +623,7 @@ function findMovies(query) {
 }
 
 // ========================================
-// 10. SEND VIDEO
+// 13. SEND VIDEO
 // ========================================
 
 async function sendVideo(ctx, movie) {
@@ -628,14 +646,16 @@ async function sendVideo(ctx, movie) {
 }
 
 // ========================================
-// 11. OPEN MOVIE / SERIES / PARTS
+// 14. OPEN MOVIE / SERIES / PARTS
 // ========================================
 
 async function openMovie(ctx, group, requested = {}) {
   const records = group.records;
 
-  // Directly send requested part.
-  if (requested.part !== null && requested.part !== undefined) {
+  // Requested part: send directly.
+  if (requested.part !== null &&
+      requested.part !== undefined) {
+
     const selected = records.find(movie =>
       Number(movie.part) === Number(requested.part)
     );
@@ -643,7 +663,7 @@ async function openMovie(ctx, group, requested = {}) {
     if (selected) return sendVideo(ctx, selected);
   }
 
-  // Directly send requested episode.
+  // Requested episode: send directly.
   if (requested.episode !== null &&
       requested.episode !== undefined) {
 
@@ -658,16 +678,12 @@ async function openMovie(ctx, group, requested = {}) {
     if (selected) return sendVideo(ctx, selected);
   }
 
+  // Series.
   const episodes = records.filter(movie =>
     movie.season !== null &&
     movie.episode !== null
   );
 
-  const parts = records.filter(movie =>
-    movie.part !== null
-  );
-
-  // SERIES
   if (episodes.length) {
     const seasons = [
       ...new Set(episodes.map(movie => Number(movie.season)))
@@ -692,21 +708,39 @@ async function openMovie(ctx, group, requested = {}) {
     );
   }
 
-  // PARTS
+  // Movie parts.
+  const parts = records.filter(movie =>
+    movie.part !== null && Number(movie.part) > 0
+  );
+
   if (parts.length) {
-    const sorted = [...parts].sort(
-      (a, b) => Number(a.part) - Number(b.part)
-    );
+    const uniqueParts = new Map();
+
+    for (const movie of parts) {
+      const number = Number(movie.part);
+      const old = uniqueParts.get(number);
+
+      if (
+        !old ||
+        new Date(movie.savedAt || 0) >=
+        new Date(old.savedAt || 0)
+      ) {
+        uniqueParts.set(number, movie);
+      }
+    }
+
+    const sortedParts = [...uniqueParts.values()]
+      .sort((a, b) => Number(a.part) - Number(b.part));
 
     sessions.set(ctx.from.id, {
       type: "parts",
-      records: sorted
+      records: sortedParts
     });
 
     return ctx.reply(
       "🎬 " + group.title + "\n\nDooro qaybta:",
       Markup.inlineKeyboard(
-        sorted.map(movie => [
+        sortedParts.map(movie => [
           Markup.button.callback(
             "Qeybta " + movie.part,
             "part:" + movie.id
@@ -720,7 +754,7 @@ async function openMovie(ctx, group, requested = {}) {
 }
 
 // ========================================
-// 12. ADMIN BROADCAST ENGINE
+// 15. ADMIN BROADCAST ENGINE
 // ========================================
 
 async function broadcastMessage(ctx, messageId) {
@@ -730,8 +764,7 @@ async function broadcastMessage(ctx, messageId) {
   const total = users.length;
 
   await ctx.reply(
-    "⏳ Broadcast ayaa bilaabanaya.\n" +
-    "👥 Users: " + total
+    "⏳ Broadcast ayaa bilaabanaya.\nUsers: " + total
   );
 
   for (const user of users) {
@@ -744,17 +777,12 @@ async function broadcastMessage(ctx, messageId) {
 
       sent++;
 
-      // Telegram rate protection.
       await new Promise(resolve => setTimeout(resolve, 40));
 
     } catch (error) {
       failed++;
 
-      console.log(
-        "BROADCAST ERROR:",
-        user.id,
-        error.message
-      );
+      console.log("BROADCAST ERROR:", user.id, error.message);
     }
   }
 
@@ -767,7 +795,7 @@ async function broadcastMessage(ctx, messageId) {
 }
 
 // ========================================
-// 13. TEXT BROADCAST
+// 16. TEXT / REPLY BROADCAST
 // ========================================
 
 bot.command("broadcast", async ctx => {
@@ -799,8 +827,7 @@ bot.command("broadcast", async ctx => {
   let failed = 0;
 
   await ctx.reply(
-    "⏳ Broadcast qoraal ayaa bilaabanaya.\n" +
-    "Users: " + users.length
+    "⏳ Broadcast qoraal ayaa bilaabanaya.\nUsers: " + users.length
   );
 
   for (const user of users) {
@@ -812,7 +839,7 @@ bot.command("broadcast", async ctx => {
 
     } catch (error) {
       failed++;
-      console.log("TEXT BROADCAST ERROR:", error.message);
+      console.log("TEXT BROADCAST ERROR:", user.id, error.message);
     }
   }
 
@@ -825,16 +852,11 @@ bot.command("broadcast", async ctx => {
 });
 
 // ========================================
-// 14. VOICE / AUDIO BROADCAST
+// 17. VOICE BROADCAST
 // ========================================
 
-// Admin sends a voice directly to the bot.
-// Bot asks for confirmation before sending to everyone.
-
 async function prepareVoiceBroadcast(ctx) {
-  if (Number(ctx.from.id) !== ADMIN_ID) {
-    return;
-  }
+  if (Number(ctx.from.id) !== ADMIN_ID) return;
 
   pendingBroadcasts.set(ADMIN_ID, {
     chatId: ctx.chat.id,
@@ -843,9 +865,9 @@ async function prepareVoiceBroadcast(ctx) {
 
   return ctx.reply(
     "🎙️ VOICE BROADCAST\n\n" +
-    "Codkaaga wuxuu gaari doonaa users-ka bot-ka.\n\n" +
+    "Codkaaga waxaa loo diri doonaa dhammaan users-ka bot-ka.\n\n" +
     "👥 Users: " + users.length + "\n\n" +
-    "Ma rabtaa inaad dhammaan u dirto?",
+    "Ma rabtaa inaad dirto?",
     Markup.inlineKeyboard([
       [
         Markup.button.callback(
@@ -865,11 +887,9 @@ async function prepareVoiceBroadcast(ctx) {
 
 bot.on("voice", prepareVoiceBroadcast);
 bot.on("audio", prepareVoiceBroadcast);
-
-// Support round video messages too.
 bot.on("video_note", prepareVoiceBroadcast);
 
-// Confirm voice broadcast.
+// Confirm voice.
 bot.action("voice_broadcast_yes", async ctx => {
   await ctx.answerCbQuery();
 
@@ -880,7 +900,7 @@ bot.action("voice_broadcast_yes", async ctx => {
   const pending = pendingBroadcasts.get(ADMIN_ID);
 
   if (!pending) {
-    return ctx.reply("⚠️ Cod la dirayo lama helin.");
+    return ctx.reply("⚠️ Codka lama helin. Mar kale soo dir.");
   }
 
   pendingBroadcasts.delete(ADMIN_ID);
@@ -888,9 +908,7 @@ bot.action("voice_broadcast_yes", async ctx => {
   let sent = 0;
   let failed = 0;
 
-  await ctx.reply(
-    "⏳ Codka ayaa loo dirayaa users-ka..."
-  );
+  await ctx.reply("⏳ Voice Broadcast ayaa bilaabanaya...");
 
   for (const user of users) {
     try {
@@ -907,39 +925,31 @@ bot.action("voice_broadcast_yes", async ctx => {
     } catch (error) {
       failed++;
 
-      console.log(
-        "VOICE BROADCAST ERROR:",
-        user.id,
-        error.message
-      );
+      console.log("VOICE ERROR:", user.id, error.message);
     }
   }
 
   return ctx.reply(
     "✅ VOICE BROADCAST DHAMMAADAY!\n\n" +
     "👥 Users: " + users.length + "\n" +
-    "🎙️ La gaarsiiyay: " + sent + "\n" +
+    "🎙️ La diray: " + sent + "\n" +
     "❌ Fashilmay: " + failed
   );
 });
 
-// Cancel voice broadcast.
+// Cancel voice.
 bot.action("voice_broadcast_no", async ctx => {
   await ctx.answerCbQuery();
 
-  if (Number(ctx.from.id) !== ADMIN_ID) {
-    return;
-  }
+  if (Number(ctx.from.id) !== ADMIN_ID) return;
 
   pendingBroadcasts.delete(ADMIN_ID);
 
-  return ctx.reply(
-    "❌ Voice Broadcast waa la joojiyay."
-  );
+  return ctx.reply("❌ Voice Broadcast waa la joojiyay.");
 });
 
 // ========================================
-// 15. ADMIN STATISTICS
+// 18. ADMIN STATISTICS
 // ========================================
 
 bot.command("stats", async ctx => {
@@ -1010,24 +1020,20 @@ bot.command("stats", async ctx => {
 
   return ctx.reply(
     "📊 AMERICAN FILMS STATISTICS\n\n" +
-
     "👥 ALL TIME USERS: " + users.length + "\n" +
     "📅 LAST MONTH USERS (" + monthName + "): " +
     lastMonthUsers + "\n" +
-
     "❓ Old users without date: " +
     oldUsersWithoutDate + "\n\n" +
-
     "🎬 ALL TIME MOVIES: " + movies.length + "\n" +
     "📅 LAST MONTH MOVIES: " + lastMonthMovies + "\n\n" +
-
     "📢 VEXORA MOVIES: " + channelOneMovies + "\n" +
     "📢 SOMALI FILM: " + channelTwoMovies
   );
 });
 
 // ========================================
-// 16. SEARCH HANDLER
+// 19. SEARCH HANDLER
 // ========================================
 
 bot.on("text", async ctx => {
@@ -1044,16 +1050,16 @@ bot.on("text", async ctx => {
 
   if (!results.length) {
     return ctx.reply(
-      "❌ Filimkan lama helin.\n\n" +
-      "Hubi magaca ama isku day magac kale."
+      "❌ Filimkan lama helin.\n\nIsku day magac kale."
     );
   }
 
+  // One result: open directly.
   if (results.length === 1) {
     return openMovie(ctx, results[0], parsedQuery);
   }
 
-  // If top result is clearly better, open it directly.
+  // Strong exact result: do not show unrelated titles.
   if (
     results[0].score >= 0.93 &&
     results[0].score - results[1].score >= 0.12
@@ -1081,7 +1087,7 @@ bot.on("text", async ctx => {
 });
 
 // ========================================
-// 17. SELECT MOVIE TITLE
+// 20. SELECT TITLE
 // ========================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
@@ -1107,7 +1113,7 @@ bot.action(/^title:(\d+)$/, async ctx => {
 });
 
 // ========================================
-// 18. SELECT SEASON
+// 21. SELECT SEASON
 // ========================================
 
 bot.action(/^season:(\d+)$/, async ctx => {
@@ -1149,7 +1155,7 @@ bot.action(/^season:(\d+)$/, async ctx => {
 });
 
 // ========================================
-// 19. SELECT EPISODE
+// 22. SELECT EPISODE
 // ========================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
@@ -1177,7 +1183,7 @@ bot.action(/^episode:(\d+)$/, async ctx => {
 });
 
 // ========================================
-// 20. SELECT PART
+// 23. SELECT PART
 // ========================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
@@ -1205,7 +1211,7 @@ bot.action(/^part:(\d+)$/, async ctx => {
 });
 
 // ========================================
-// 21. ERROR HANDLING
+// 24. ERROR HANDLING
 // ========================================
 
 bot.catch(error => {
@@ -1213,7 +1219,7 @@ bot.catch(error => {
 });
 
 // ========================================
-// 22. START BOT
+// 25. START BOT
 // ========================================
 
 bot.launch({
