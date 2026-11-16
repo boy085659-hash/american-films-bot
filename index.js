@@ -66,7 +66,6 @@ function safeSave(file, data) {
   const temp = file + '.tmp';
   const backup = file + '.bak';
 
-  // Backup old database before changing it.
   if (fs.existsSync(file)) {
     fs.copyFileSync(file, backup);
   }
@@ -107,12 +106,11 @@ function saveUsers() {
   safeSave(USERS_DB, users);
 }
 
-// Save normalized users without removing their existing fields.
 saveUsers();
 
 
 // =====================================================
-// 3. TITLE / CAPTION PARSING
+// 3. TITLE / CAPTION PARSING - IMPROVED
 // =====================================================
 
 function normalize(value) {
@@ -123,6 +121,22 @@ function normalize(value) {
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim()
     .replace(/\s+/g, ' ');
+}
+
+function cleanTitle(value) {
+  return String(value || '')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/@[\w]+/g, ' ')
+    .replace(/#[\w]+/g, ' ')
+    .replace(/[🎬🎥📺🍿⭐🔥❤️✅]/gu, ' ')
+    .replace(/\b(?:480p|720p|1080p|1440p|2160p|4k|8k|hd|full\s*hd|uhd|hdr|web\s*dl|bluray|brrip|webrip)\b/gi, ' ')
+    .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+    .replace(/[|:–—]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^(?:movie|film|filim)\s+/i, '')
+    .trim();
 }
 
 function parseCaption(caption) {
@@ -137,6 +151,7 @@ function parseCaption(caption) {
   let season = null;
   let episode = null;
   let part = null;
+
   let marker = null;
 
   const episodePatterns = [
@@ -171,7 +186,6 @@ function parseCaption(caption) {
     }
   }
 
-  // Supports Part, Qeybta, Qaybta and common spelling variations.
   const partRe =
     /\b(?:part|pt|qeyb(?:ta|teda|teeda)?|qayb(?:ta|teda|teeda)?|qeyt(?:a|eda)?|cd|disc|disk)\s*[:#-]?\s*0*(\d+)\b/i;
 
@@ -185,40 +199,35 @@ function parseCaption(caption) {
     }
   }
 
-  let titleLine = lines[0] || '';
+  // Use the first meaningful caption line as the title.
+  let titleLine = lines.find(line =>
+    !/^https?:\/\//i.test(line) &&
+    !/^[@#]/.test(line)
+  ) || '';
 
+  // Remove Season / Episode / Part suffixes.
   if (marker !== null) {
-    const before = raw
-      .slice(0, marker)
-      .split('\n')
-      .filter(x => x.trim())
-      .pop();
+    const before = raw.slice(0, marker);
 
-    if (before) titleLine = before;
-  } else {
-    const useful = lines.find(line =>
-      !/^https?:\/\//i.test(line) &&
-      !/^[@#]/.test(line)
-    );
+    const beforeLines = before.split('\n')
+      .map(x => x.trim())
+      .filter(Boolean);
 
-    if (useful) titleLine = useful;
+    if (beforeLines.length) {
+      titleLine = beforeLines[beforeLines.length - 1];
+    }
   }
 
-  let title = titleLine
-    .replace(/https?:\/\/\S+/gi, ' ')
-    .replace(/@[\w]+/g, ' ')
-    .replace(/#[\w]+/g, ' ')
-    .replace(/[🎬🎥📺🍿⭐🔥❤️✅]/gu, ' ')
-    .replace(/\b(?:480p|720p|1080p|1440p|2160p|4k|8k|hd|full\s*hd|uhd|hdr|web\s*dl|bluray|brrip|webrip)\b/gi, ' ')
-    .replace(/\b(?:19|20)\d{2}\b/g, ' ')
-    .replace(/[|:–—]+/g, ' ')
-    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  // Also remove season information if it appears without an episode.
+  titleLine = titleLine
+    .replace(/\bSeason\s*0*\d+\b.*$/i, '')
+    .replace(/\bS\s*0*\d+\s*(?:E|EP)\s*0*\d+.*$/i, '')
+    .replace(/\b(?:Episode|EP)\s*0*\d+.*$/i, '')
+    .replace(/\b\d{1,2}\s*x\s*\d{1,3}.*$/i, '')
+    .replace(partRe, '')
+    .replace(/\s*[-–—|:]+\s*$/g, '');
 
-  title = title
-    .replace(/^(?:movie|film|filim)\s+/i, '')
-    .trim();
+  const title = cleanTitle(titleLine);
 
   return {
     title,
@@ -235,22 +244,52 @@ function parseCaption(caption) {
 }
 
 function getMovieInfo(movie) {
-  const parsed = parseCaption(movie.caption || movie.title || '');
+  const captionInfo = parseCaption(movie.caption || '');
+
+  // Captions are the most reliable source for old episode records.
+  const hasCaptionEpisode =
+    captionInfo.episode !== null;
+
+  const hasCaptionPart =
+    captionInfo.part !== null;
 
   const season =
-    parsed.season ??
-    (movie.season != null ? Number(movie.season) : null);
+    hasCaptionEpisode
+      ? captionInfo.season
+      : movie.season != null
+        ? Number(movie.season)
+        : captionInfo.season;
 
   const episode =
-    parsed.episode ??
-    (movie.episode != null ? Number(movie.episode) : null);
+    hasCaptionEpisode
+      ? captionInfo.episode
+      : movie.episode != null
+        ? Number(movie.episode)
+        : null;
 
   const part =
-    parsed.part ??
-    (movie.part != null ? Number(movie.part) : null);
+    hasCaptionPart
+      ? captionInfo.part
+      : movie.part != null
+        ? Number(movie.part)
+        : null;
 
-  // Prefer the already saved clean title when available.
-  const title = movie.title || parsed.title || '';
+  // When caption contains a valid episode/part, use its clean title.
+  // This repairs old saved titles containing Season / Episode text.
+  let title;
+
+  if (
+    (hasCaptionEpisode || hasCaptionPart) &&
+    captionInfo.title
+  ) {
+    title = captionInfo.title;
+  } else {
+    title = cleanTitle(movie.title || captionInfo.title || '');
+  }
+
+  if (!title) {
+    title = cleanTitle(captionInfo.title || movie.title || '');
+  }
 
   return {
     title,
@@ -342,7 +381,6 @@ bot.on('channel_post', ctx => {
     movies.push(record);
   }
 
-  // Update the matching record without removing old fields.
   Object.assign(record, {
     caption: post.caption,
     title: info.title,
@@ -453,7 +491,7 @@ bot.action('check_join', async ctx => {
 
 
 // =====================================================
-// 7. SEARCH / GROUP RECORDS
+// 7. SEARCH / GROUP RECORDS - IMPROVED
 // =====================================================
 
 function levenshtein(a, b) {
@@ -486,23 +524,44 @@ function similarity(a, b) {
   if (!a || !b) return 0;
 
   if (a === b) return 1;
-  if (b.includes(a)) return 0.97;
-  if (a.includes(b)) return 0.94;
 
-  const aw = a.split(' ');
-  const bw = b.split(' ');
+  const aw = a.split(' ').filter(Boolean);
+  const bw = b.split(' ').filter(Boolean);
 
-  const scores = aw.map(word =>
-    Math.max(
-      ...bw.map(other =>
-        1 - levenshtein(word, other) /
-        Math.max(word.length, other.length)
-      )
-    )
-  );
+  if (!aw.length || !bw.length) return 0;
 
-  return scores.reduce((x, y) => x + y, 0) /
-    scores.length * 0.9;
+  // Token matching prevents a short word from matching
+  // every title that happens to contain that word.
+  const matched = aw.map(word => {
+    let best = 0;
+
+    for (const other of bw) {
+      const distance = levenshtein(word, other);
+
+      const score =
+        1 - distance / Math.max(word.length, other.length);
+
+      if (score > best) best = score;
+    }
+
+    return best;
+  });
+
+  const average =
+    matched.reduce((sum, value) => sum + value, 0) /
+    matched.length;
+
+  const coverage =
+    aw.filter(word => bw.includes(word)).length /
+    aw.length;
+
+  const lengthPenalty =
+    Math.min(aw.length, bw.length) /
+    Math.max(aw.length, bw.length);
+
+  return average * 0.65 +
+    coverage * 0.25 +
+    lengthPenalty * 0.10;
 }
 
 function newestRecord(a, b) {
@@ -628,17 +687,16 @@ function findMovies(query) {
   const parsed = parseCaption(query);
   const q = parsed.key || normalize(query);
 
+  if (!q) return [];
+
   let groups = buildGroups()
     .map(group => ({
       ...group,
       score: similarity(q, group.key)
     }))
-    .filter(group =>
-      group.score >= (
-        q.split(' ').length === 1 ? 0.70 : 0.66
-      )
-    );
+    .filter(group => group.score >= 0.55);
 
+  // If the query contains an episode number, find that episode.
   if (parsed.episode !== null) {
     const matching = groups.filter(g =>
       g.episodes.some(record => {
@@ -718,7 +776,6 @@ async function getPoster(title, kind) {
 
     const queryKey = normalize(title);
 
-    // Prefer the closest matching title with a poster.
     const candidates = results
       .filter(item => item.poster_path)
       .map(item => {
@@ -841,7 +898,6 @@ async function sendVideo(ctx, record, groupTitle) {
 
 async function openGroup(ctx, group, requested = {}) {
 
-  // Direct episode request.
   if (
     requested.episode !== null &&
     requested.episode !== undefined
@@ -863,7 +919,6 @@ async function openGroup(ctx, group, requested = {}) {
     }
   }
 
-  // Direct part request.
   if (
     requested.part !== null &&
     requested.part !== undefined
@@ -878,7 +933,7 @@ async function openGroup(ctx, group, requested = {}) {
     }
   }
 
-  // SERIES: Poster -> Seasons -> Poster -> Episodes.
+  // SERIES: Poster -> Available Seasons -> Episodes.
   if (group.kind === 'series') {
     const seasons = [
       ...new Set(
@@ -887,7 +942,7 @@ async function openGroup(ctx, group, requested = {}) {
         )
       )
     ]
-      .filter(n => n > 0)
+      .filter(n => Number.isFinite(n) && n > 0)
       .sort((a, b) => a - b);
 
     sessions.set(ctx.from.id, {
@@ -911,11 +966,11 @@ async function openGroup(ctx, group, requested = {}) {
       'series',
       keyboard,
       '📺 Musalsalka: ' + group.title +
-      '\n\nDooro xilliga (Season):'
+      '\n\nDooro Season-ka:'
     );
   }
 
-  // MULTIPART MOVIE: Poster -> Parts.
+  // MULTIPART MOVIE.
   if (group.kind === 'parts') {
     sessions.set(ctx.from.id, {
       type: 'parts',
@@ -941,7 +996,7 @@ async function openGroup(ctx, group, requested = {}) {
     );
   }
 
-  // SINGLE MOVIE: Poster -> Watch button.
+  // SINGLE MOVIE.
   const record = group.records.reduce(
     (best, current) => newestRecord(best, current)
   );
@@ -973,7 +1028,7 @@ async function openGroup(ctx, group, requested = {}) {
 
 
 // =====================================================
-// 11. TEXT SEARCH
+// 11. TEXT SEARCH - DIRECT MATCH FIX
 // =====================================================
 
 bot.on('text', async ctx => {
@@ -994,23 +1049,26 @@ bot.on('text', async ctx => {
     );
   }
 
-  if (
-    results.length === 1 ||
+  const best = results[0];
+  const second = results[1];
+
+  // Exact title match: open directly.
+  const exactMatch =
+    normalize(parsed.title || query) === best.key;
+
+  // Strong match with a clear lead: open directly.
+  const strongMatch =
+    best.score >= 0.84 &&
     (
-      results[0].score >= 0.93 &&
-      (
-        !results[1] ||
-        results[0].score - results[1].score >= 0.12
-      )
-    )
-  ) {
-    return openGroup(
-      ctx,
-      results[0],
-      parsed
+      !second ||
+      best.score - second.score >= 0.08
     );
+
+  if (exactMatch || strongMatch) {
+    return openGroup(ctx, best, parsed);
   }
 
+  // Only show choices when there are genuinely competing titles.
   sessions.set(ctx.from.id, {
     type: 'titles',
     groups: results,
@@ -1018,7 +1076,7 @@ bot.on('text', async ctx => {
   });
 
   return ctx.reply(
-    '🎬 Filimadan ayaa ugu dhow magaca aad qortay. Mid dooro:',
+    '🎬 Magacyo dhow ayaa la helay. Midka aad rabto dooro:',
 
     Markup.inlineKeyboard(
       results.map((group, index) => [
@@ -1091,7 +1149,6 @@ bot.action(/^movie:(\d+)$/, async ctx => {
     record = session.record;
     title = session.group.title;
   } else {
-    // Recover the movie if the user's session was reset.
     record = movies.find(movie =>
       Number(movie.id) === movieId
     );
@@ -1473,15 +1530,15 @@ bot.launch({
     );
 
     console.log(
-      'Single movies: poster -> watch button -> video.'
+      'Search: direct matching title -> poster.'
     );
 
     console.log(
-      'Series: poster -> seasons -> poster -> episodes.'
+      'Series: poster -> available seasons -> available episodes.'
     );
 
     console.log(
-      'Multipart movies: poster -> parts.'
+      'Multipart movies: poster -> available parts.'
     );
 
     console.log(
