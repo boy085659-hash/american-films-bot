@@ -10,6 +10,7 @@ const path = require("path");
 const BOT_TOKEN =
   process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const ADMIN_ID = 7199419196;
 
 const CHANNELS = [
@@ -38,9 +39,7 @@ function loadArray(file, property) {
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data[property])) return data[property];
 
-  throw new Error(
-    "Database format is not recognized: " + path.basename(file)
-  );
+  throw new Error("Database format is not recognized: " + path.basename(file));
 }
 
 function safeSave(file, data) {
@@ -87,7 +86,42 @@ function saveUsers() {
 saveUsers();
 
 // =====================================================
-// 3. TEXT NORMALIZATION
+// 3. TMDB POSTER SEARCH
+// =====================================================
+
+async function getTmdbPoster(title) {
+  if (!TMDB_API_KEY) {
+    console.log("TMDB_API_KEY is missing");
+    return null;
+  }
+
+  try {
+    const url = new URL("https://api.themoviedb.org/3/search/tv");
+    url.searchParams.set("api_key", TMDB_API_KEY);
+    url.searchParams.set("query", title);
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      console.log("TMDB ERROR:", response.status);
+      return null;
+    }
+
+    const data = await response.json();
+
+    const show = data.results?.find(item => item.poster_path);
+
+    if (!show) return null;
+
+    return "https://image.tmdb.org/t/p/w500" + show.poster_path;
+  } catch (error) {
+    console.error("TMDB POSTER ERROR:", error.message);
+    return null;
+  }
+}
+
+// =====================================================
+// 4. TEXT NORMALIZATION
 // =====================================================
 
 function normalize(value) {
@@ -100,9 +134,6 @@ function normalize(value) {
     .replace(/\s+/g, " ");
 }
 
-// Remove Part / Season / Episode information from title key.
-// This helps captions with slightly different formatting
-// belong to the same movie group.
 function canonicalTitle(value) {
   return normalize(
     String(value || "")
@@ -113,7 +144,7 @@ function canonicalTitle(value) {
 }
 
 // =====================================================
-// 4. CAPTION PARSER
+// 5. CAPTION PARSER
 // =====================================================
 
 function parseCaption(caption) {
@@ -146,7 +177,6 @@ function parseCaption(caption) {
     part = Number(partMatch[1]);
   }
 
-  // Look for the first line that appears to contain a title.
   let title = "";
 
   for (const line of lines) {
@@ -181,7 +211,7 @@ function parseCaption(caption) {
 }
 
 // =====================================================
-// 5. READ OLD RECORDS
+// 6. READ OLD RECORDS
 // =====================================================
 
 function getMovieInfo(movie) {
@@ -214,7 +244,7 @@ function getMovieInfo(movie) {
 }
 
 // =====================================================
-// 6. REGISTER USERS
+// 7. REGISTER USERS
 // =====================================================
 
 bot.use(async (ctx, next) => {
@@ -237,7 +267,7 @@ bot.use(async (ctx, next) => {
 });
 
 // =====================================================
-// 7. RECEIVE VIDEOS FROM BOTH CHANNELS
+// 8. RECEIVE VIDEOS FROM CHANNELS
 // =====================================================
 
 bot.on("channel_post", ctx => {
@@ -308,16 +338,11 @@ bot.on("channel_post", ctx => {
 
   saveMovies();
 
-  console.log(
-    "Movie saved:",
-    parsed.title,
-    parsed.part ? "Part " + parsed.part : "",
-    channelUsername
-  );
+  console.log("Movie saved:", parsed.title, channelUsername);
 });
 
 // =====================================================
-// 8. SUBSCRIPTION CHECK
+// 9. SUBSCRIPTION CHECK
 // =====================================================
 
 async function isJoined(userId) {
@@ -353,7 +378,7 @@ async function showJoin(ctx) {
 }
 
 // =====================================================
-// 9. START
+// 10. START
 // =====================================================
 
 bot.start(async ctx => {
@@ -373,7 +398,7 @@ bot.action("check_join", async ctx => {
 });
 
 // =====================================================
-// 10. FUZZY SEARCH
+// 11. FUZZY SEARCH
 // =====================================================
 
 function distance(a, b) {
@@ -436,10 +461,7 @@ function similarity(query, title) {
 }
 
 // =====================================================
-// 11. DUPLICATE FILTERING
-// One Part number = one video.
-// One Season + Episode = one video.
-// Old database records are not deleted.
+// 12. DUPLICATE FILTERING
 // =====================================================
 
 function newestRecord(a, b) {
@@ -458,7 +480,6 @@ function uniqueEpisodes(records) {
 
   for (const movie of records) {
     const info = getMovieInfo(movie);
-
     const season = Number(info.season);
     const episode = Number(info.episode);
 
@@ -470,11 +491,10 @@ function uniqueEpisodes(records) {
     unique.set(key, previous ? newestRecord(previous, movie) : movie);
   }
 
-  return [...unique.values()]
-    .sort((a, b) =>
-      Number(getMovieInfo(a).season) - Number(getMovieInfo(b).season) ||
-      Number(getMovieInfo(a).episode) - Number(getMovieInfo(b).episode)
-    );
+  return [...unique.values()].sort((a, b) =>
+    Number(getMovieInfo(a).season) - Number(getMovieInfo(b).season) ||
+    Number(getMovieInfo(a).episode) - Number(getMovieInfo(b).episode)
+  );
 }
 
 function uniqueParts(records) {
@@ -488,7 +508,6 @@ function uniqueParts(records) {
 
     const previous = unique.get(part);
 
-    // Keep only one best/newest video for each Part number.
     unique.set(part, previous ? newestRecord(previous, movie) : movie);
   }
 
@@ -498,8 +517,7 @@ function uniqueParts(records) {
 }
 
 // =====================================================
-// 12. FIND MOVIES
-// Both channels are grouped using the same cleaned title.
+// 13. FIND MOVIES
 // =====================================================
 
 function findMovies(query) {
@@ -572,7 +590,7 @@ function findMovies(query) {
 }
 
 // =====================================================
-// 13. SEND ONE VIDEO
+// 14. SEND ONE VIDEO
 // =====================================================
 
 async function sendVideo(ctx, movie) {
@@ -594,13 +612,13 @@ async function sendVideo(ctx, movie) {
 }
 
 // =====================================================
-// 14. OPEN MOVIE / SERIES / PARTS
+// 15. OPEN MOVIE / SERIES WITH POSTER
 // =====================================================
 
 async function openMovie(ctx, group, requested = {}) {
   const records = group.records;
 
-  // If user searched for a specific Part, send only that Part.
+  // Specific Part
   if (requested.part !== null && requested.part !== undefined) {
     const selected = uniqueParts(records).find(
       movie => Number(getMovieInfo(movie).part) === Number(requested.part)
@@ -609,7 +627,7 @@ async function openMovie(ctx, group, requested = {}) {
     if (selected) return sendVideo(ctx, selected);
   }
 
-  // If user searched for a specific Episode, send only that Episode.
+  // Specific Episode
   if (requested.episode !== null && requested.episode !== undefined) {
     const selected = uniqueEpisodes(records).find(movie => {
       const info = getMovieInfo(movie);
@@ -626,6 +644,10 @@ async function openMovie(ctx, group, requested = {}) {
     if (selected) return sendVideo(ctx, selected);
   }
 
+  // Get poster from TMDB
+  const poster = await getTmdbPoster(group.title);
+
+  // SERIES
   const episodes = uniqueEpisodes(records.filter(movie => {
     const info = getMovieInfo(movie);
 
@@ -643,17 +665,27 @@ async function openMovie(ctx, group, requested = {}) {
       episodes
     });
 
-    return ctx.reply(
-      "📺 " + group.title + "\n\nDooro Season:",
-      Markup.inlineKeyboard(
-        seasons.map(season => [
-          Markup.button.callback("Season " + season, "season:" + season)
-        ])
-      )
+    const keyboard = Markup.inlineKeyboard(
+      seasons.map(season => [
+        Markup.button.callback("Season " + season, "season:" + season)
+      ])
     );
+
+    const caption =
+      "📺 Musalsalka: " + group.title +
+      "\n\nDooro xilliga (Season):";
+
+    if (poster) {
+      return ctx.replyWithPhoto(poster, {
+        caption,
+        ...keyboard
+      });
+    }
+
+    return ctx.reply(caption, keyboard);
   }
 
-  // Deduplicate parts before creating buttons.
+  // PARTS
   const parts = uniqueParts(records);
 
   if (parts.length) {
@@ -662,24 +694,43 @@ async function openMovie(ctx, group, requested = {}) {
       records: parts
     });
 
-    return ctx.reply(
-      "🎬 " + group.title + "\n\nDooro qaybta:",
-      Markup.inlineKeyboard(
-        parts.map(movie => [
-          Markup.button.callback(
-            "Qeybta " + getMovieInfo(movie).part,
-            "part:" + movie.id
-          )
-        ])
-      )
+    const keyboard = Markup.inlineKeyboard(
+      parts.map(movie => [
+        Markup.button.callback(
+          "Qeybta " + getMovieInfo(movie).part,
+          "part:" + movie.id
+        )
+      ])
     );
+
+    const caption =
+      "🎬 Filimka: " + group.title +
+      "\n\nDooro qaybta:";
+
+    if (poster) {
+      return ctx.replyWithPhoto(poster, {
+        caption,
+        ...keyboard
+      });
+    }
+
+    return ctx.reply(caption, keyboard);
   }
 
-  return sendVideo(ctx, records[records.length - 1]);
+  // NORMAL MOVIE
+  const movie = records[records.length - 1];
+
+  if (poster) {
+    await ctx.replyWithPhoto(poster, {
+      caption: "🎬 " + group.title
+    });
+  }
+
+  return sendVideo(ctx, movie);
 }
 
 // =====================================================
-// 15. ADMIN BROADCAST
+// 16. ADMIN BROADCAST
 // =====================================================
 
 async function broadcastMessage(ctx, messageId) {
@@ -759,7 +810,7 @@ bot.command("broadcast", async ctx => {
 });
 
 // =====================================================
-// 16. VOICE / AUDIO / VIDEO NOTE BROADCAST
+// 17. VOICE / AUDIO / VIDEO NOTE BROADCAST
 // =====================================================
 
 async function prepareVoiceBroadcast(ctx) {
@@ -841,7 +892,7 @@ bot.action("voice_broadcast_no", async ctx => {
 });
 
 // =====================================================
-// 17. ADMIN STATISTICS
+// 18. ADMIN STATISTICS
 // =====================================================
 
 bot.command("stats", async ctx => {
@@ -909,7 +960,7 @@ bot.command("stats", async ctx => {
 });
 
 // =====================================================
-// 18. SEARCH HANDLER
+// 19. SEARCH HANDLER
 // =====================================================
 
 bot.on("text", async ctx => {
@@ -958,7 +1009,7 @@ bot.on("text", async ctx => {
 });
 
 // =====================================================
-// 19. SELECT TITLE
+// 20. SELECT TITLE
 // =====================================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
@@ -984,7 +1035,7 @@ bot.action(/^title:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 20. SELECT SEASON
+// 21. SELECT SEASON
 // =====================================================
 
 bot.action(/^season:(\d+)$/, async ctx => {
@@ -1025,8 +1076,7 @@ bot.action(/^season:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 21. SELECT EPISODE
-// Sends ONE video only.
+// 22. SELECT EPISODE
 // =====================================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
@@ -1054,8 +1104,7 @@ bot.action(/^episode:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 22. SELECT PART
-// Sends ONE video only.
+// 23. SELECT PART
 // =====================================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
@@ -1083,7 +1132,7 @@ bot.action(/^part:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 23. ERROR HANDLING
+// 24. ERROR HANDLING
 // =====================================================
 
 bot.catch(error => {
@@ -1091,18 +1140,19 @@ bot.catch(error => {
 });
 
 // =====================================================
-// 24. START BOT
+// 25. START BOT
 // =====================================================
 
 bot.launch({
   allowedUpdates: ["message", "callback_query", "channel_post"]
 });
 
-console.log("🎬 American Films Bot is running!");
-console.log("📢 Listening to both movie channels.");
-console.log("🔎 Smart Movie Search enabled.");
-console.log("🎞️ Duplicate Part filtering enabled.");
-console.log("🎙️ Voice Broadcast enabled.");
+console.log("American Films Bot is running!");
+console.log("TMDB poster search:", TMDB_API_KEY ? "Enabled" : "Missing API key");
+console.log("Listening to both movie channels.");
+console.log("Smart Movie Search enabled.");
+console.log("Duplicate filtering enabled.");
+console.log("Voice Broadcast enabled.");
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
