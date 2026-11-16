@@ -31,7 +31,7 @@ const CHANNELS = [
 ];
 
 if (!BOT_TOKEN) {
-  throw new Error('BOT TOKEN IS MISSING. Set BOT_TOKEN in Environment Variables.');
+  throw new Error('BOT TOKEN IS MISSING');
 }
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -41,7 +41,7 @@ const USERS_DB = path.join(__dirname, 'users.json');
 
 const sessions = new Map();
 const pendingBroadcasts = new Map();
-const posterCache = new Map();
+const tmdbCache = new Map();
 
 
 // =====================================================
@@ -51,7 +51,9 @@ const posterCache = new Map();
 function loadArray(file, property) {
   if (!fs.existsSync(file)) return [];
 
-  const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const parsed = JSON.parse(
+    fs.readFileSync(file, 'utf8')
+  );
 
   if (Array.isArray(parsed)) return parsed;
 
@@ -59,7 +61,9 @@ function loadArray(file, property) {
     return parsed[property];
   }
 
-  throw new Error('Database format error: ' + path.basename(file));
+  throw new Error(
+    'Database format error: ' + path.basename(file)
+  );
 }
 
 function safeSave(file, data) {
@@ -70,7 +74,12 @@ function safeSave(file, data) {
     fs.copyFileSync(file, backup);
   }
 
-  fs.writeFileSync(temp, JSON.stringify(data, null, 2), 'utf8');
+  fs.writeFileSync(
+    temp,
+    JSON.stringify(data, null, 2),
+    'utf8'
+  );
+
   fs.renameSync(temp, file);
 }
 
@@ -81,14 +90,18 @@ let users = loadArray(USERS_DB, 'users')
     if (typeof user === 'number' || typeof user === 'string') {
       return {
         id: Number(user),
-        firstSeen: null
+        firstSeen: null,
+        favorites: []
       };
     }
 
     return {
       ...user,
       id: Number(user.id),
-      firstSeen: user.firstSeen || null
+      firstSeen: user.firstSeen || null,
+      favorites: Array.isArray(user.favorites)
+        ? user.favorites
+        : []
     };
   })
   .filter(user => Number.isFinite(user.id));
@@ -106,11 +119,30 @@ function saveUsers() {
   safeSave(USERS_DB, users);
 }
 
-saveUsers();
+function getUser(userId) {
+  return users.find(user => user.id === Number(userId));
+}
+
+function getOrCreateUser(userId) {
+  let user = getUser(userId);
+
+  if (!user) {
+    user = {
+      id: Number(userId),
+      firstSeen: new Date().toISOString(),
+      favorites: []
+    };
+
+    users.push(user);
+    saveUsers();
+  }
+
+  return user;
+}
 
 
 // =====================================================
-// 3. TITLE / CAPTION PARSING - IMPROVED
+// 3. TITLE NORMALIZATION
 // =====================================================
 
 function normalize(value) {
@@ -139,6 +171,29 @@ function cleanTitle(value) {
     .trim();
 }
 
+// Common spelling corrections and aliases.
+// Add more names here whenever needed.
+const SEARCH_ALIASES = {
+  'money host': 'money heist',
+  'mony heist': 'money heist',
+  'moneyhest': 'money heist',
+  'money heistt': 'money heist',
+  'la casa de papel': 'money heist',
+  'john wik': 'john wick',
+  'jon wick': 'john wick',
+  'topgun': 'top gun'
+};
+
+function correctQuery(query) {
+  const q = normalize(query);
+  return SEARCH_ALIASES[q] || q;
+}
+
+
+// =====================================================
+// 4. CAPTION PARSING
+// =====================================================
+
 function parseCaption(caption) {
   const raw = String(caption || '')
     .replace(/\r/g, '')
@@ -151,7 +206,6 @@ function parseCaption(caption) {
   let season = null;
   let episode = null;
   let part = null;
-
   let marker = null;
 
   const episodePatterns = [
@@ -172,7 +226,9 @@ function parseCaption(caption) {
   }
 
   if (episode === null) {
-    const ep = raw.match(/\b(?:Episode|EP|E)\s*0*(\d+)\b/i);
+    const ep = raw.match(
+      /\b(?:Episode|EP|E)\s*0*(\d+)\b/i
+    );
 
     if (ep) {
       episode = Number(ep[1]);
@@ -187,7 +243,7 @@ function parseCaption(caption) {
   }
 
   const partRe =
-    /\b(?:part|pt|qeyb(?:ta|teda|teeda)?|qayb(?:ta|teda|teeda)?|qeyt(?:a|eda)?|cd|disc|disk)\s*[:#-]?\s*0*(\d+)\b/i;
+    /\b(?:part|pt|qeyb(?:ta|teda|teeda)?|qayb(?:ta|teda|teeda)?|cd|disc|disk)\s*[:#-]?\s*0*(\d+)\b/i;
 
   const pm = raw.match(partRe);
 
@@ -199,16 +255,13 @@ function parseCaption(caption) {
     }
   }
 
-  // Use the first meaningful caption line as the title.
   let titleLine = lines.find(line =>
     !/^https?:\/\//i.test(line) &&
     !/^[@#]/.test(line)
   ) || '';
 
-  // Remove Season / Episode / Part suffixes.
   if (marker !== null) {
     const before = raw.slice(0, marker);
-
     const beforeLines = before.split('\n')
       .map(x => x.trim())
       .filter(Boolean);
@@ -218,7 +271,6 @@ function parseCaption(caption) {
     }
   }
 
-  // Also remove season information if it appears without an episode.
   titleLine = titleLine
     .replace(/\bSeason\s*0*\d+\b.*$/i, '')
     .replace(/\bS\s*0*\d+\s*(?:E|EP)\s*0*\d+.*$/i, '')
@@ -246,36 +298,30 @@ function parseCaption(caption) {
 function getMovieInfo(movie) {
   const captionInfo = parseCaption(movie.caption || '');
 
-  // Captions are the most reliable source for old episode records.
   const hasCaptionEpisode =
     captionInfo.episode !== null;
 
   const hasCaptionPart =
     captionInfo.part !== null;
 
-  const season =
-    hasCaptionEpisode
-      ? captionInfo.season
-      : movie.season != null
-        ? Number(movie.season)
-        : captionInfo.season;
+  const season = hasCaptionEpisode
+    ? captionInfo.season
+    : movie.season != null
+      ? Number(movie.season)
+      : captionInfo.season;
 
-  const episode =
-    hasCaptionEpisode
-      ? captionInfo.episode
-      : movie.episode != null
-        ? Number(movie.episode)
-        : null;
+  const episode = hasCaptionEpisode
+    ? captionInfo.episode
+    : movie.episode != null
+      ? Number(movie.episode)
+      : null;
 
-  const part =
-    hasCaptionPart
-      ? captionInfo.part
-      : movie.part != null
-        ? Number(movie.part)
-        : null;
+  const part = hasCaptionPart
+    ? captionInfo.part
+    : movie.part != null
+      ? Number(movie.part)
+      : null;
 
-  // When caption contains a valid episode/part, use its clean title.
-  // This repairs old saved titles containing Season / Episode text.
   let title;
 
   if (
@@ -284,11 +330,15 @@ function getMovieInfo(movie) {
   ) {
     title = captionInfo.title;
   } else {
-    title = cleanTitle(movie.title || captionInfo.title || '');
+    title = cleanTitle(
+      movie.title || captionInfo.title || ''
+    );
   }
 
   if (!title) {
-    title = cleanTitle(captionInfo.title || movie.title || '');
+    title = cleanTitle(
+      captionInfo.title || movie.title || ''
+    );
   }
 
   return {
@@ -300,28 +350,19 @@ function getMovieInfo(movie) {
     type: episode !== null || movie.type === 'series'
       ? 'series'
       : part !== null
-        ? 'part'
+        ? 'parts'
         : 'movie'
   };
 }
 
 
 // =====================================================
-// 4. REGISTER USERS
+// 5. REGISTER USERS
 // =====================================================
 
 bot.use(async (ctx, next) => {
   if (ctx.chat?.type === 'private' && ctx.from) {
-    const id = Number(ctx.from.id);
-
-    if (!users.some(user => user.id === id)) {
-      users.push({
-        id,
-        firstSeen: new Date().toISOString()
-      });
-
-      saveUsers();
-    }
+    getOrCreateUser(ctx.from.id);
   }
 
   return next();
@@ -329,7 +370,7 @@ bot.use(async (ctx, next) => {
 
 
 // =====================================================
-// 5. RECEIVE CHANNEL VIDEOS
+// 6. RECEIVE CHANNEL VIDEOS
 // =====================================================
 
 bot.on('channel_post', ctx => {
@@ -358,13 +399,7 @@ bot.on('channel_post', ctx => {
 
   const info = parseCaption(post.caption);
 
-  if (!info.key) {
-    console.log(
-      'Skipped: no title detected:',
-      post.caption.slice(0, 120)
-    );
-    return;
-  }
+  if (!info.key) return;
 
   let record = movies.find(m =>
     String(m.chatId) === String(ctx.chat.id) &&
@@ -395,18 +430,12 @@ bot.on('channel_post', ctx => {
 
   saveMovies();
 
-  console.log(
-    'Saved:',
-    info.title,
-    info.season ? `S${info.season}` : '',
-    info.episode ? `E${info.episode}` : '',
-    info.part ? `Part ${info.part}` : ''
-  );
+  console.log('SAVED:', info.title);
 });
 
 
 // =====================================================
-// 6. JOIN CHECK
+// 7. SUBSCRIBE CHECK
 // =====================================================
 
 async function isJoined(userId) {
@@ -424,12 +453,7 @@ async function isJoined(userId) {
       if (!joined) return false;
 
     } catch (error) {
-      console.error(
-        'JOIN CHECK:',
-        channel.username,
-        error.message
-      );
-
+      console.error('JOIN CHECK:', error.message);
       return false;
     }
   }
@@ -445,22 +469,13 @@ async function showJoin(ctx) {
 
     Markup.inlineKeyboard([
       [
-        Markup.button.url(
-          '📢 Somali Film',
-          CHANNELS[1].link
-        )
+        Markup.button.url('📢 Somali Film', CHANNELS[1].link)
       ],
       [
-        Markup.button.url(
-          '🎬 VEXORA MOVIES',
-          CHANNELS[0].link
-        )
+        Markup.button.url('🎬 VEXORA MOVIES', CHANNELS[0].link)
       ],
       [
-        Markup.button.callback(
-          '✅ Waan join gareeyay',
-          'check_join'
-        )
+        Markup.button.callback('✅ Waan join gareeyay', 'check_join')
       ]
     ])
   );
@@ -473,7 +488,9 @@ bot.start(async ctx => {
 
   return ctx.reply(
     '🎬 Ku soo dhowow American Somali Films!\n\n' +
-    'Qor magaca filimka ama musalsalka aad rabto.'
+    'Qor magaca filimka ama musalsalka aad rabto.\n\n' +
+    '⭐ /favorites - Filimada aad kaydsatay\n' +
+    'ℹ️ /help - Caawimaad'
   );
 });
 
@@ -491,7 +508,7 @@ bot.action('check_join', async ctx => {
 
 
 // =====================================================
-// 7. SEARCH / GROUP RECORDS - IMPROVED
+// 8. SMART SEARCH ENGINE
 // =====================================================
 
 function levenshtein(a, b) {
@@ -520,40 +537,51 @@ function levenshtein(a, b) {
   return row[b.length];
 }
 
-function similarity(a, b) {
+function wordSimilarity(a, b) {
+  if (a === b) return 1;
+
   if (!a || !b) return 0;
 
+  const distance = levenshtein(a, b);
+
+  return 1 - distance / Math.max(a.length, b.length);
+}
+
+function similarity(a, b) {
+  if (!a || !b) return 0;
   if (a === b) return 1;
+
+  if (b.includes(a) || a.includes(b)) {
+    const shorter = Math.min(a.length, b.length);
+    const longer = Math.max(a.length, b.length);
+
+    return 0.85 + (shorter / longer) * 0.15;
+  }
 
   const aw = a.split(' ').filter(Boolean);
   const bw = b.split(' ').filter(Boolean);
 
   if (!aw.length || !bw.length) return 0;
 
-  // Token matching prevents a short word from matching
-  // every title that happens to contain that word.
-  const matched = aw.map(word => {
+  let total = 0;
+  let matched = 0;
+
+  for (const word of aw) {
     let best = 0;
 
     for (const other of bw) {
-      const distance = levenshtein(word, other);
-
-      const score =
-        1 - distance / Math.max(word.length, other.length);
+      const score = wordSimilarity(word, other);
 
       if (score > best) best = score;
     }
 
-    return best;
-  });
+    total += best;
 
-  const average =
-    matched.reduce((sum, value) => sum + value, 0) /
-    matched.length;
+    if (best >= 0.65) matched++;
+  }
 
-  const coverage =
-    aw.filter(word => bw.includes(word)).length /
-    aw.length;
+  const average = total / aw.length;
+  const coverage = matched / aw.length;
 
   const lengthPenalty =
     Math.min(aw.length, bw.length) /
@@ -568,9 +596,7 @@ function newestRecord(a, b) {
   const da = new Date(a.savedAt || 0).getTime() || 0;
   const db = new Date(b.savedAt || 0).getTime() || 0;
 
-  if (da !== db) {
-    return da > db ? a : b;
-  }
+  if (da !== db) return da > db ? a : b;
 
   return Number(a.id) >= Number(b.id) ? a : b;
 }
@@ -589,9 +615,7 @@ function uniqueEpisodes(records) {
       !Number.isFinite(e) ||
       s < 1 ||
       e < 1
-    ) {
-      continue;
-    }
+    ) continue;
 
     const key = `${s}:${e}`;
 
@@ -667,15 +691,12 @@ function buildGroups() {
   }
 
   return [...map.values()].map(group => {
-    const episodes = uniqueEpisodes(group.records);
-    const parts = uniqueParts(group.records);
+    group.episodes = uniqueEpisodes(group.records);
+    group.parts = uniqueParts(group.records);
 
-    group.episodes = episodes;
-    group.parts = parts;
-
-    group.kind = episodes.length
+    group.kind = group.episodes.length
       ? 'series'
-      : parts.length
+      : group.parts.length
         ? 'parts'
         : 'movie';
 
@@ -685,7 +706,7 @@ function buildGroups() {
 
 function findMovies(query) {
   const parsed = parseCaption(query);
-  const q = parsed.key || normalize(query);
+  const q = correctQuery(parsed.key || query);
 
   if (!q) return [];
 
@@ -694,9 +715,8 @@ function findMovies(query) {
       ...group,
       score: similarity(q, group.key)
     }))
-    .filter(group => group.score >= 0.55);
+    .filter(group => group.score >= 0.48);
 
-  // If the query contains an episode number, find that episode.
   if (parsed.episode !== null) {
     const matching = groups.filter(g =>
       g.episodes.some(record => {
@@ -732,25 +752,39 @@ function findMovies(query) {
 
 
 // =====================================================
-// 8. TMDB POSTERS
+// 9. TMDB POSTER AND INFORMATION
 // =====================================================
 
-async function getPoster(title, kind) {
-  if (!TMDB_API_KEY) {
-    console.error(
-      'TMDB_API_KEY is missing. Add it in Environment Variables.'
-    );
+const GENRES = {
+  28: 'Action',
+  12: 'Adventure',
+  16: 'Animation',
+  35: 'Comedy',
+  80: 'Crime',
+  99: 'Documentary',
+  18: 'Drama',
+  10751: 'Family',
+  14: 'Fantasy',
+  36: 'History',
+  27: 'Horror',
+  10402: 'Music',
+  9648: 'Mystery',
+  10749: 'Romance',
+  878: 'Science Fiction',
+  10770: 'TV Movie',
+  53: 'Thriller',
+  10752: 'War',
+  37: 'Western'
+};
 
-    return null;
-  }
+async function getTMDBInfo(title, kind) {
+  if (!TMDB_API_KEY) return null;
 
   const category = kind === 'series' ? 'tv' : 'movie';
+  const cacheKey = category + ':' + normalize(title);
 
-  const cacheKey =
-    category + ':' + normalize(title);
-
-  if (posterCache.has(cacheKey)) {
-    return posterCache.get(cacheKey);
+  if (tmdbCache.has(cacheKey)) {
+    return tmdbCache.get(cacheKey);
   }
 
   try {
@@ -760,11 +794,7 @@ async function getPoster(title, kind) {
       `&query=${encodeURIComponent(title)}` +
       '&include_adult=false';
 
-    const response = await fetch(url, {
-      headers: {
-        accept: 'application/json'
-      }
-    });
+    const response = await fetch(url);
 
     if (!response.ok) {
       throw new Error('TMDB HTTP ' + response.status);
@@ -772,44 +802,69 @@ async function getPoster(title, kind) {
 
     const data = await response.json();
 
-    const results = data.results || [];
-
-    const queryKey = normalize(title);
-
-    const candidates = results
-      .filter(item => item.poster_path)
+    const results = (data.results || [])
       .map(item => {
-        const resultTitle =
-          normalize(item.title || item.name || '');
+        const name = item.title || item.name || '';
 
         return {
           item,
-          score: similarity(queryKey, resultTitle)
+          score: similarity(
+            normalize(title),
+            normalize(name)
+          )
         };
       })
       .sort((a, b) => b.score - a.score);
 
-    const result = candidates.length
-      ? candidates[0].item
-      : null;
+    const best = results[0];
 
-    const poster = result
-      ? 'https://image.tmdb.org/t/p/w500' +
-        result.poster_path
-      : null;
+    const result =
+      best && best.score >= 0.45
+        ? {
+            title: best.item.title || best.item.name,
+            overview: best.item.overview || '',
+            date: best.item.release_date ||
+              best.item.first_air_date || '',
+            poster: best.item.poster_path
+              ? 'https://image.tmdb.org/t/p/w500' +
+                best.item.poster_path
+              : null,
+            genres: (best.item.genre_ids || [])
+              .map(id => GENRES[id])
+              .filter(Boolean)
+          }
+        : null;
 
-    posterCache.set(cacheKey, poster);
+    tmdbCache.set(cacheKey, result);
 
-    return poster;
+    return result;
 
   } catch (error) {
-    console.error(
-      'TMDB POSTER ERROR:',
-      error.message
-    );
-
+    console.error('TMDB ERROR:', error.message);
     return null;
   }
+}
+
+function formatMovieCaption(title, info, extra = '') {
+  let text = '🎬 ' + title;
+
+  if (info?.date) {
+    text += '\n📅 Year: ' + info.date.slice(0, 4);
+  }
+
+  if (info?.genres?.length) {
+    text += '\n🎭 Genre: ' + info.genres.join(', ');
+  }
+
+  if (info?.overview) {
+    text += '\n\n📝 ' + info.overview.slice(0, 450);
+  }
+
+  if (extra) {
+    text += '\n\n' + extra;
+  }
+
+  return text.slice(0, 1020);
 }
 
 async function sendPosterMenu(
@@ -817,36 +872,41 @@ async function sendPosterMenu(
   title,
   kind,
   keyboard,
-  caption
+  extra = ''
 ) {
-  const poster = await getPoster(title, kind);
+  const info = await getTMDBInfo(title, kind);
 
-  const text = caption || ('🎬 ' + title);
+  const caption = formatMovieCaption(
+    title,
+    info,
+    extra
+  );
 
-  if (poster) {
+  if (info?.poster) {
     try {
-      return await ctx.replyWithPhoto(poster, {
-        caption: text,
-        reply_markup: keyboard.reply_markup
-      });
+      return await ctx.replyWithPhoto(
+        info.poster,
+        {
+          caption,
+          reply_markup: keyboard.reply_markup
+        }
+      );
 
     } catch (error) {
-      console.error(
-        'POSTER SEND ERROR:',
-        error.message
-      );
+      console.error('POSTER SEND ERROR:', error.message);
     }
   }
 
   return ctx.reply(
-    text + '\n\n🖼️ Poster-ka hadda lama helin. Doorashada hoose isticmaal.',
+    caption +
+    '\n\n🖼️ Poster lama helin. Isticmaal badhanka hoose.',
     keyboard
   );
 }
 
 
 // =====================================================
-// 9. SEND VIDEO
+// 10. SEND VIDEO
 // =====================================================
 
 async function sendVideo(ctx, record, groupTitle) {
@@ -880,24 +940,140 @@ async function sendVideo(ctx, record, groupTitle) {
     );
 
   } catch (error) {
-    console.error(
-      'VIDEO SEND ERROR:',
-      error.message
-    );
+    console.error('VIDEO SEND ERROR:', error.message);
 
     await ctx.reply(
-      '⚠️ Video-ga lama soo diri karin. Fadlan mar kale isku day.'
+      '⚠️ Video-ga lama soo diri karin. Hubi in bot-ku leeyahay rukhsadda channel-ka.'
     );
   }
 }
 
 
 // =====================================================
-// 10. OPEN TITLE
+// 11. FAVORITES
+// =====================================================
+
+function isFavorite(userId, key) {
+  const user = getOrCreateUser(userId);
+
+  return user.favorites.includes(key);
+}
+
+function toggleFavorite(userId, key) {
+  const user = getOrCreateUser(userId);
+
+  if (user.favorites.includes(key)) {
+    user.favorites = user.favorites.filter(
+      item => item !== key
+    );
+
+    saveUsers();
+    return false;
+  }
+
+  user.favorites.push(key);
+  saveUsers();
+
+  return true;
+}
+
+function favoriteButton(userId, key) {
+  const saved = isFavorite(userId, key);
+
+  return Markup.button.callback(
+    saved ? '❤️ Ka saar Favorites' : '⭐ Ku dar Favorites',
+    'favorite:toggle'
+  );
+}
+
+bot.command('favorites', async ctx => {
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
+
+  const user = getOrCreateUser(ctx.from.id);
+
+  if (!user.favorites.length) {
+    return ctx.reply(
+      '⭐ Weli wax filim ah kuma kaydsan Favorites.'
+    );
+  }
+
+  const groups = buildGroups().filter(group =>
+    user.favorites.includes(group.key)
+  );
+
+  if (!groups.length) {
+    return ctx.reply(
+      'Filimadii aad kaydsatay hadda lama helin.'
+    );
+  }
+
+  sessions.set(ctx.from.id, {
+    type: 'favorites',
+    groups
+  });
+
+  return ctx.reply(
+    '❤️ FILIMADA AAD JECESHAHAY\n\nDooro filimka:',
+    Markup.inlineKeyboard(
+      groups.map((group, index) => [
+        Markup.button.callback(
+          '🎬 ' + group.title,
+          'favorite:open:' + index
+        )
+      ])
+    )
+  );
+});
+
+bot.action('favorite:toggle', async ctx => {
+  await ctx.answerCbQuery();
+
+  const session = sessions.get(ctx.from.id);
+
+  if (!session?.group) {
+    return ctx.reply('Fadlan mar kale raadi filimka.');
+  }
+
+  const saved = toggleFavorite(
+    ctx.from.id,
+    session.group.key
+  );
+
+  return ctx.reply(
+    saved
+      ? '❤️ Filimka Favorites ayaa lagu daray.'
+      : '🗑️ Filimka Favorites waa laga saaray.'
+  );
+});
+
+bot.action(/^favorite:open:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery();
+
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
+
+  const session = sessions.get(ctx.from.id);
+
+  if (!session || session.type !== 'favorites') {
+    return ctx.reply('Fadlan mar kale fur Favorites.');
+  }
+
+  const group = session.groups[Number(ctx.match[1])];
+
+  if (!group) return ctx.reply('Filimka lama helin.');
+
+  return openGroup(ctx, group);
+});
+
+
+// =====================================================
+// 12. OPEN TITLE / SEASON / EPISODE
 // =====================================================
 
 async function openGroup(ctx, group, requested = {}) {
-
   if (
     requested.episode !== null &&
     requested.episode !== undefined
@@ -933,7 +1109,6 @@ async function openGroup(ctx, group, requested = {}) {
     }
   }
 
-  // SERIES: Poster -> Available Seasons -> Episodes.
   if (group.kind === 'series') {
     const seasons = [
       ...new Set(
@@ -951,52 +1126,50 @@ async function openGroup(ctx, group, requested = {}) {
       selectedSeason: null
     });
 
-    const keyboard = Markup.inlineKeyboard(
-      seasons.map(season => [
+    const keyboard = Markup.inlineKeyboard([
+      ...seasons.map(season => [
         Markup.button.callback(
-          'Season ' + season,
+          '📺 Season ' + season,
           'season:' + season
         )
-      ])
-    );
+      ]),
+      [favoriteButton(ctx.from.id, group.key)]
+    ]);
 
     return sendPosterMenu(
       ctx,
       group.title,
       'series',
       keyboard,
-      '📺 Musalsalka: ' + group.title +
-      '\n\nDooro Season-ka:'
+      '📺 Musalsalka\n\nDooro Season-ka:'
     );
   }
 
-  // MULTIPART MOVIE.
   if (group.kind === 'parts') {
     sessions.set(ctx.from.id, {
       type: 'parts',
       group
     });
 
-    const keyboard = Markup.inlineKeyboard(
-      group.parts.map(record => [
+    const keyboard = Markup.inlineKeyboard([
+      ...group.parts.map(record => [
         Markup.button.callback(
-          'Part ' + getMovieInfo(record).part,
+          '▶️ Part ' + getMovieInfo(record).part,
           'part:' + record.id
         )
-      ])
-    );
+      ]),
+      [favoriteButton(ctx.from.id, group.key)]
+    ]);
 
     return sendPosterMenu(
       ctx,
       group.title,
       'movie',
       keyboard,
-      '🎬 ' + group.title +
-      '\n\nDooro qaybta (Part):'
+      '🎬 Filim qaybo leh\n\nDooro Part-ka:'
     );
   }
 
-  // SINGLE MOVIE.
   const record = group.records.reduce(
     (best, current) => newestRecord(best, current)
   );
@@ -1010,10 +1183,11 @@ async function openGroup(ctx, group, requested = {}) {
   const keyboard = Markup.inlineKeyboard([
     [
       Markup.button.callback(
-        '🎬 Daawo Filimka',
+        '▶️ Daawo Filimka',
         'movie:' + record.id
       )
-    ]
+    ],
+    [favoriteButton(ctx.from.id, group.key)]
   ]);
 
   return sendPosterMenu(
@@ -1021,14 +1195,13 @@ async function openGroup(ctx, group, requested = {}) {
     group.title,
     'movie',
     keyboard,
-    '🎬 ' + group.title +
-    '\n\nTaabo badhanka hoose si aad u daawato filimka.'
+    '🎬 Taabo badhanka si aad u daawato.'
   );
 }
 
 
 // =====================================================
-// 11. TEXT SEARCH - DIRECT MATCH FIX
+// 13. TEXT SEARCH - SMART DIRECT MATCH
 // =====================================================
 
 bot.on('text', async ctx => {
@@ -1045,20 +1218,23 @@ bot.on('text', async ctx => {
 
   if (!results.length) {
     return ctx.reply(
-      '❌ Filimkan lama helin.\n\nIsku day magac kale.'
+      '❌ Filimkan lama helin.\n\n' +
+      'Hubi magaca ama isku day qoraal kale.'
     );
   }
 
   const best = results[0];
   const second = results[1];
 
-  // Exact title match: open directly.
-  const exactMatch =
-    normalize(parsed.title || query) === best.key;
+  const corrected = correctQuery(
+    parsed.key || query
+  );
 
-  // Strong match with a clear lead: open directly.
+  const exactMatch =
+    corrected === best.key;
+
   const strongMatch =
-    best.score >= 0.84 &&
+    best.score >= 0.70 &&
     (
       !second ||
       best.score - second.score >= 0.08
@@ -1068,30 +1244,65 @@ bot.on('text', async ctx => {
     return openGroup(ctx, best, parsed);
   }
 
-  // Only show choices when there are genuinely competing titles.
+  // Ambiguous results: send individual posters.
   sessions.set(ctx.from.id, {
     type: 'titles',
     groups: results,
     requested: parsed
   });
 
-  return ctx.reply(
-    '🎬 Magacyo dhow ayaa la helay. Midka aad rabto dooro:',
-
-    Markup.inlineKeyboard(
-      results.map((group, index) => [
-        Markup.button.callback(
-          group.title,
-          'title:' + index
-        )
-      ])
-    )
+  await ctx.reply(
+    '🎬 Waxaan helay filimo dhow.\n' +
+    'Dooro midka aad raadineyso:'
   );
+
+  for (let i = 0; i < results.length; i++) {
+    const group = results[i];
+
+    const info = await getTMDBInfo(
+      group.title,
+      group.kind === 'series' ? 'series' : 'movie'
+    );
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          '✅ Dooro ' + group.title.slice(0, 35),
+          'title:' + i
+        )
+      ]
+    ]);
+
+    if (info?.poster) {
+      try {
+        await ctx.replyWithPhoto(
+          info.poster,
+          {
+            caption: formatMovieCaption(
+              group.title,
+              info
+            ),
+            reply_markup: keyboard.reply_markup
+          }
+        );
+
+        continue;
+
+      } catch (error) {
+        console.error('SEARCH POSTER:', error.message);
+      }
+    }
+
+    await ctx.reply(
+      '🎬 ' + group.title,
+      keyboard
+    );
+  }
 });
 
 
 // =====================================================
-// 12. TITLE BUTTON
+// 14. TITLE BUTTON
 // =====================================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
@@ -1104,16 +1315,12 @@ bot.action(/^title:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== 'titles') {
-    return ctx.reply(
-      'Fadlan mar kale raadi filimka.'
-    );
+    return ctx.reply('Fadlan mar kale raadi filimka.');
   }
 
   const group = session.groups[Number(ctx.match[1])];
 
-  if (!group) {
-    return ctx.reply('Filimka lama helin.');
-  }
+  if (!group) return ctx.reply('Filimka lama helin.');
 
   return openGroup(
     ctx,
@@ -1124,7 +1331,7 @@ bot.action(/^title:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 13. SINGLE MOVIE BUTTON
+// 15. MOVIE BUTTON
 // =====================================================
 
 bot.action(/^movie:(\d+)$/, async ctx => {
@@ -1135,7 +1342,6 @@ bot.action(/^movie:(\d+)$/, async ctx => {
   }
 
   const movieId = Number(ctx.match[1]);
-
   const session = sessions.get(ctx.from.id);
 
   let record = null;
@@ -1159,9 +1365,7 @@ bot.action(/^movie:(\d+)$/, async ctx => {
   }
 
   if (!record) {
-    return ctx.reply(
-      'Filimkan hadda lama helin. Fadlan mar kale raadi.'
-    );
+    return ctx.reply('Filimkan hadda lama helin.');
   }
 
   return sendVideo(ctx, record, title);
@@ -1169,7 +1373,7 @@ bot.action(/^movie:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 14. SEASON BUTTON
+// 16. SEASON BUTTON
 // =====================================================
 
 bot.action(/^season:(\d+)$/, async ctx => {
@@ -1182,9 +1386,7 @@ bot.action(/^season:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== 'series') {
-    return ctx.reply(
-      'Fadlan mar kale raadi musalsalka.'
-    );
+    return ctx.reply('Fadlan mar kale raadi musalsalka.');
   }
 
   const season = Number(ctx.match[1]);
@@ -1195,21 +1397,25 @@ bot.action(/^season:(\d+)$/, async ctx => {
   );
 
   if (!episodes.length) {
-    return ctx.reply(
-      'Season-kan xogtiisa lama helin.'
-    );
+    return ctx.reply('Season-kan xogtiisa lama helin.');
   }
 
   session.selectedSeason = season;
 
-  const keyboard = Markup.inlineKeyboard(
-    episodes.map(record => [
+  const keyboard = Markup.inlineKeyboard([
+    ...episodes.map(record => [
       Markup.button.callback(
-        'EP ' + getMovieInfo(record).episode,
+        '▶️ Episode ' + getMovieInfo(record).episode,
         'episode:' + record.id
       )
-    ])
-  );
+    ]),
+    [
+      Markup.button.callback(
+        '⭐ Favorites',
+        'favorite:toggle'
+      )
+    ]
+  ]);
 
   return sendPosterMenu(
     ctx,
@@ -1218,13 +1424,13 @@ bot.action(/^season:(\d+)$/, async ctx => {
     keyboard,
     '📺 ' + session.group.title +
     '\nSeason ' + season +
-    '\n\nDooro Episode:'
+    '\n\nDooro Episode-ka:'
   );
 });
 
 
 // =====================================================
-// 15. EPISODE BUTTON
+// 17. EPISODE BUTTON
 // =====================================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
@@ -1237,9 +1443,7 @@ bot.action(/^episode:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== 'series') {
-    return ctx.reply(
-      'Fadlan mar kale raadi musalsalka.'
-    );
+    return ctx.reply('Fadlan mar kale raadi musalsalka.');
   }
 
   const record = session.group.episodes.find(item =>
@@ -1249,21 +1453,15 @@ bot.action(/^episode:(\d+)$/, async ctx => {
   );
 
   if (!record) {
-    return ctx.reply(
-      'Episode-kan lama helin.'
-    );
+    return ctx.reply('Episode-kan lama helin.');
   }
 
-  return sendVideo(
-    ctx,
-    record,
-    session.group.title
-  );
+  return sendVideo(ctx, record, session.group.title);
 });
 
 
 // =====================================================
-// 16. PART BUTTON
+// 18. PART BUTTON
 // =====================================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
@@ -1276,31 +1474,36 @@ bot.action(/^part:(\d+)$/, async ctx => {
   const session = sessions.get(ctx.from.id);
 
   if (!session || session.type !== 'parts') {
-    return ctx.reply(
-      'Fadlan mar kale raadi filimka.'
-    );
+    return ctx.reply('Fadlan mar kale raadi filimka.');
   }
 
   const record = session.group.parts.find(item =>
     Number(item.id) === Number(ctx.match[1])
   );
 
-  if (!record) {
-    return ctx.reply(
-      'Qaybtan lama helin.'
-    );
-  }
+  if (!record) return ctx.reply('Qaybtan lama helin.');
 
-  return sendVideo(
-    ctx,
-    record,
-    session.group.title
+  return sendVideo(ctx, record, session.group.title);
+});
+
+
+// =====================================================
+// 19. HELP
+// =====================================================
+
+bot.command('help', async ctx => {
+  return ctx.reply(
+    '🎬 AMERICAN SOMALI FILMS\n\n' +
+    '🔎 Qor magaca filimka si aad u raadiso.\n' +
+    '⭐ /favorites - Filimada aad kaydsatay.\n' +
+    'ℹ️ /help - Caawimaad.\n\n' +
+    'Haddii aad qalad ku qorto magaca, bot-ku wuxuu isku dayayaa inuu fahmo.'
   );
 });
 
 
 // =====================================================
-// 17. ADMIN BROADCAST
+// 20. ADMIN BROADCAST
 // =====================================================
 
 async function broadcastMessage(ctx, messageId) {
@@ -1327,12 +1530,7 @@ async function broadcastMessage(ctx, messageId) {
 
     } catch (error) {
       failed++;
-
-      console.log(
-        'BROADCAST ERROR:',
-        user.id,
-        error.message
-      );
+      console.log('BROADCAST ERROR:', user.id, error.message);
     }
   }
 
@@ -1356,33 +1554,24 @@ bot.command('broadcast', async ctx => {
     .trim();
 
   if (replied) {
-    return broadcastMessage(
-      ctx,
-      replied.message_id
-    );
+    return broadcastMessage(ctx, replied.message_id);
   }
 
   if (!message) {
     return ctx.reply(
       'Qor: /broadcast Fariintaada\n' +
-      'Ama reply saar sawir/video/cod kadib qor /broadcast.'
+      'Ama reply saar fariin kadib qor /broadcast.'
     );
   }
 
   let sent = 0;
   let failed = 0;
 
-  await ctx.reply(
-    '⏳ Broadcast qoraal ayaa bilaabanaya.'
-  );
+  await ctx.reply('⏳ Broadcast qoraal ayaa bilaabanaya.');
 
   for (const user of users) {
     try {
-      await ctx.telegram.sendMessage(
-        user.id,
-        message
-      );
-
+      await ctx.telegram.sendMessage(user.id, message);
       sent++;
 
       await new Promise(resolve =>
@@ -1412,19 +1601,12 @@ async function prepareMediaBroadcast(ctx) {
 
   return ctx.reply(
     '📢 Fariintan ma u dirnaa dhammaan users-ka?',
-
     Markup.inlineKeyboard([
       [
-        Markup.button.callback(
-          '✅ Haa, dir',
-          'broadcast_yes'
-        )
+        Markup.button.callback('✅ Haa, dir', 'broadcast_yes')
       ],
       [
-        Markup.button.callback(
-          '❌ Jooji',
-          'broadcast_no'
-        )
+        Markup.button.callback('❌ Jooji', 'broadcast_no')
       ]
     ])
   );
@@ -1442,16 +1624,11 @@ bot.action('broadcast_yes', async ctx => {
 
   const pending = pendingBroadcasts.get(ADMIN_ID);
 
-  if (!pending) {
-    return ctx.reply('Fariinta lama helin.');
-  }
+  if (!pending) return ctx.reply('Fariinta lama helin.');
 
   pendingBroadcasts.delete(ADMIN_ID);
 
-  return broadcastMessage(
-    ctx,
-    pending.messageId
-  );
+  return broadcastMessage(ctx, pending.messageId);
 });
 
 bot.action('broadcast_no', async ctx => {
@@ -1466,7 +1643,7 @@ bot.action('broadcast_no', async ctx => {
 
 
 // =====================================================
-// 18. ADMIN STATS
+// 21. ADMIN STATS
 // =====================================================
 
 bot.command('stats', async ctx => {
@@ -1476,32 +1653,65 @@ bot.command('stats', async ctx => {
 
   const groups = buildGroups();
 
+  const now = new Date();
+
+  const today = users.filter(user => {
+    if (!user.firstSeen) return false;
+
+    const date = new Date(user.firstSeen);
+
+    return date.toDateString() === now.toDateString();
+  }).length;
+
+  const lastMonth = users.filter(user => {
+    if (!user.firstSeen) return false;
+
+    const date = new Date(user.firstSeen);
+
+    return (
+      date.getMonth() === now.getMonth() - 1 &&
+      date.getFullYear() === (
+        now.getMonth() === 0
+          ? now.getFullYear() - 1
+          : now.getFullYear()
+      )
+    );
+  }).length;
+
+  const totalFavorites = users.reduce(
+    (sum, user) => sum + (user.favorites || []).length,
+    0
+  );
+
   return ctx.reply(
     '📊 AMERICAN SOMALI FILMS\n\n' +
 
-    '👥 Users: ' + users.length + '\n' +
+    '👥 ALL TIME USERS: ' + users.length + '\n' +
+    '🆕 USERS TODAY: ' + today + '\n' +
+    '📅 USERS LAST MONTH: ' + lastMonth + '\n\n' +
 
-    '🎬 Video records: ' + movies.length + '\n' +
+    '🎬 VIDEO RECORDS: ' + movies.length + '\n' +
+    '📚 FILM / SERIES GROUPS: ' + groups.length + '\n' +
 
-    '📚 Film / Series groups: ' + groups.length + '\n' +
-
-    '📺 Series: ' +
+    '📺 SERIES: ' +
     groups.filter(g => g.kind === 'series').length + '\n' +
 
-    '🎞️ Films with parts: ' +
+    '🎞️ FILMS WITH PARTS: ' +
     groups.filter(g => g.kind === 'parts').length + '\n' +
 
-    '🎬 Single movies: ' +
-    groups.filter(g => g.kind === 'movie').length + '\n' +
+    '🎬 SINGLE MOVIES: ' +
+    groups.filter(g => g.kind === 'movie').length + '\n\n' +
+
+    '❤️ FAVORITES SAVED: ' + totalFavorites + '\n' +
 
     '🖼️ TMDB: ' +
-    (TMDB_API_KEY ? 'API key detected' : 'API key missing')
+    (TMDB_API_KEY ? 'Enabled' : 'API key missing')
   );
 });
 
 
 // =====================================================
-// 19. ERROR HANDLING / STARTUP
+// 22. ERROR HANDLING / STARTUP
 // =====================================================
 
 bot.catch(error => {
@@ -1516,41 +1726,16 @@ bot.launch({
   ]
 })
   .then(() => {
-    console.log(
-      'American Somali Films Bot is running!'
-    );
-
-    console.log(
-      'Listening to both movie channels.'
-    );
-
-    console.log(
-      'TMDB poster search:',
-      TMDB_API_KEY ? 'Enabled' : 'Missing API key'
-    );
-
-    console.log(
-      'Search: direct matching title -> poster.'
-    );
-
-    console.log(
-      'Series: poster -> available seasons -> available episodes.'
-    );
-
-    console.log(
-      'Multipart movies: poster -> available parts.'
-    );
-
-    console.log(
-      'Existing movies.json and users.json preserved.'
-    );
+    console.log('American Somali Films Bot is running!');
+    console.log('Smart Search: Enabled');
+    console.log('TMDB Posters:', TMDB_API_KEY ? 'Enabled' : 'Missing');
+    console.log('Series: Poster -> Seasons -> Episodes -> Video');
+    console.log('Favorites: Enabled');
+    console.log('Stats: Enabled');
+    console.log('Old movies.json and users.json preserved.');
   })
   .catch(error => {
-    console.error(
-      'BOT LAUNCH ERROR:',
-      error
-    );
-
+    console.error('BOT LAUNCH ERROR:', error);
     process.exit(1);
   });
 
