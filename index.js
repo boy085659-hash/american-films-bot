@@ -8,9 +8,11 @@ const path = require("path");
 // =====================================================
 
 const BOT_TOKEN =
-  process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+  process.env.BOT_TOKEN ||
+  process.env.TELEGRAM_BOT_TOKEN ||
+  process.env.TELEGRAM_TOKEN ||
+  process.env.TOKEN;
 
-const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const ADMIN_ID = 7199419196;
 
 const CHANNELS = [
@@ -19,7 +21,7 @@ const CHANNELS = [
 ];
 
 if (!BOT_TOKEN) {
-  throw new Error("BOT_TOKEN or TELEGRAM_BOT_TOKEN is missing");
+  throw new Error("BOT TOKEN IS MISSING. Check FadeHost Environment Variables.");
 }
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -27,8 +29,11 @@ const bot = new Telegraf(BOT_TOKEN);
 const MOVIES_DB = path.join(__dirname, "movies.json");
 const USERS_DB = path.join(__dirname, "users.json");
 
+const sessions = new Map();
+const pendingBroadcasts = new Map();
+
 // =====================================================
-// 2. DATABASE
+// 2. DATABASE - PRESERVE OLD DATA
 // =====================================================
 
 function loadArray(file, property) {
@@ -39,7 +44,7 @@ function loadArray(file, property) {
   if (Array.isArray(data)) return data;
   if (data && Array.isArray(data[property])) return data[property];
 
-  throw new Error("Database format is not recognized: " + path.basename(file));
+  throw new Error("Database format error: " + path.basename(file));
 }
 
 function safeSave(file, data) {
@@ -59,7 +64,10 @@ let users = loadArray(USERS_DB, "users");
 
 users = users.map(user => {
   if (typeof user === "number" || typeof user === "string") {
-    return { id: Number(user), firstSeen: null };
+    return {
+      id: Number(user),
+      firstSeen: null
+    };
   }
 
   return {
@@ -70,10 +78,9 @@ users = users.map(user => {
 }).filter(user => Number.isFinite(user.id));
 
 let nextMovieId =
-  movies.reduce((max, movie) => Math.max(max, Number(movie.id) || 0), 0) + 1;
-
-const sessions = new Map();
-const pendingBroadcasts = new Map();
+  movies.reduce((max, movie) => {
+    return Math.max(max, Number(movie.id) || 0);
+  }, 0) + 1;
 
 function saveMovies() {
   safeSave(MOVIES_DB, movies);
@@ -86,42 +93,7 @@ function saveUsers() {
 saveUsers();
 
 // =====================================================
-// 3. TMDB POSTER SEARCH
-// =====================================================
-
-async function getTmdbPoster(title) {
-  if (!TMDB_API_KEY) {
-    console.log("TMDB_API_KEY is missing");
-    return null;
-  }
-
-  try {
-    const url = new URL("https://api.themoviedb.org/3/search/tv");
-    url.searchParams.set("api_key", TMDB_API_KEY);
-    url.searchParams.set("query", title);
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      console.log("TMDB ERROR:", response.status);
-      return null;
-    }
-
-    const data = await response.json();
-
-    const show = data.results?.find(item => item.poster_path);
-
-    if (!show) return null;
-
-    return "https://image.tmdb.org/t/p/w500" + show.poster_path;
-  } catch (error) {
-    console.error("TMDB POSTER ERROR:", error.message);
-    return null;
-  }
-}
-
-// =====================================================
-// 4. TEXT NORMALIZATION
+// 3. NORMALIZATION
 // =====================================================
 
 function normalize(value) {
@@ -144,7 +116,9 @@ function canonicalTitle(value) {
 }
 
 // =====================================================
-// 5. CAPTION PARSER
+// 4. CAPTION PARSER
+// IMPORTANT: E01 / E02 / E08 are recognized.
+// Episode titles are removed from the series title.
 // =====================================================
 
 function parseCaption(caption) {
@@ -155,10 +129,19 @@ function parseCaption(caption) {
   let episode = null;
   let part = null;
 
+  // S01E01, S1 E01, S01 EP01
   let match = raw.match(
-    /\b(?:season|s)\s*0*(\d+)\s*(?:episode|ep|e)\s*0*(\d+)\b/i
+    /\bS\s*0*(\d+)\s*(?:E|EP)\s*0*(\d+)\b/i
   );
 
+  // Season 1 Episode 1
+  if (!match) {
+    match = raw.match(
+      /\bSeason\s*0*(\d+)\s*(?:Episode|Ep)\s*0*(\d+)\b/i
+    );
+  }
+
+  // 1x01
   if (!match) {
     match = raw.match(/\b(\d{1,2})x(\d{1,3})\b/i);
   }
@@ -166,8 +149,26 @@ function parseCaption(caption) {
   if (match) {
     season = Number(match[1]);
     episode = Number(match[2]);
+  } else {
+    // E01, EP01, Episode 01
+    const epMatch = raw.match(
+      /\b(?:E|EP|Episode)\s*0*(\d+)\b/i
+    );
+
+    if (epMatch) {
+      episode = Number(epMatch[1]);
+    }
+
+    const seasonMatch = raw.match(
+      /\bSeason\s*0*(\d+)\b/i
+    );
+
+    if (seasonMatch) {
+      season = Number(seasonMatch[1]);
+    }
   }
 
+  // Part 1, Part 2, Qeybta 1, CD 1
   const partRegex =
     /\b(?:part|pt|qeyb(?:ta|teda|teeda)?|qayb(?:ta|teda|teeda)?|cd|disc|disk)\s*[:#-]?\s*0*(\d+)\s*(?:aad|naad)?\b/i;
 
@@ -180,13 +181,45 @@ function parseCaption(caption) {
   let title = "";
 
   for (const line of lines) {
-    const cleaned = line
-      .replace(partRegex, " ")
-      .replace(/\b(?:season|episode|ep|s)\s*0*\d+\b/gi, " ")
-      .replace(/\b\d{1,2}x\d{1,3}\b/gi, " ")
+    let cleaned = line;
+
+    // Remove S01E01 and the episode name after it.
+    cleaned = cleaned.replace(
+      /\bS\s*0*\d+\s*(?:E|EP)\s*0*\d+\b.*$/i,
+      " "
+    );
+
+    // Remove E01 / EP01 and episode name after it.
+    cleaned = cleaned.replace(
+      /\b(?:E|EP|Episode)\s*0*\d+\b.*$/i,
+      " "
+    );
+
+    // Remove Season 1 Episode 1 and the rest.
+    cleaned = cleaned.replace(
+      /\bSeason\s*0*\d+\s*(?:Episode|Ep)\s*0*\d+\b.*$/i,
+      " "
+    );
+
+    // Remove 1x01 and the rest.
+    cleaned = cleaned.replace(
+      /\b\d{1,2}x\d{1,3}\b.*$/i,
+      " "
+    );
+
+    // Remove season marker.
+    cleaned = cleaned.replace(
+      /\bSeason\s*0*\d+\b/gi,
+      " "
+    );
+
+    // Remove Part marker.
+    cleaned = cleaned.replace(partRegex, " ");
+
+    cleaned = cleaned
       .replace(/#[\w]+/g, " ")
       .replace(/\.(mp4|mkv|avi|mov|webm)$/i, " ")
-      .replace(/\b(?:filim|film|movie|cusub|new|official|astaan)\b/gi, " ")
+      .replace(/\b(?:filim|film|movie|cusub|new|official)\b/gi, " ")
       .replace(/\b(?:480p|720p|1080p|1440p|2160p|4k|8k|hd|full\s*hd|uhd|hdr|web-dl|bluray|brrip|webrip)\b/gi, " ")
       .replace(/\b(?:19|20)\d{2}\b/g, " ")
       .replace(/[\p{Extended_Pictographic}\p{Regional_Indicator}]/gu, " ")
@@ -194,7 +227,10 @@ function parseCaption(caption) {
       .replace(/\s+/g, " ")
       .trim();
 
-    if (cleaned && !/^(part|pt|episode|ep|season|s)\s*\d*$/i.test(cleaned)) {
+    if (
+      cleaned &&
+      !/^(part|pt|episode|ep|season|s|e)\s*\d*$/i.test(cleaned)
+    ) {
       title = cleaned;
       break;
     }
@@ -206,20 +242,29 @@ function parseCaption(caption) {
     season,
     episode,
     part,
-    type: season !== null ? "series" : part !== null ? "part" : "movie"
+    type: season !== null
+      ? "series"
+      : part !== null
+        ? "part"
+        : "movie"
   };
 }
 
 // =====================================================
-// 6. READ OLD RECORDS
+// 5. READ OLD MOVIE RECORDS
 // =====================================================
 
 function getMovieInfo(movie) {
   const parsed = parseCaption(movie.caption || movie.title || "");
 
-  const oldSeason = movie.season != null ? Number(movie.season) : null;
-  const oldEpisode = movie.episode != null ? Number(movie.episode) : null;
-  const oldPart = movie.part != null ? Number(movie.part) : null;
+  const oldSeason =
+    movie.season != null ? Number(movie.season) : null;
+
+  const oldEpisode =
+    movie.episode != null ? Number(movie.episode) : null;
+
+  const oldPart =
+    movie.part != null ? Number(movie.part) : null;
 
   const season = parsed.season ?? oldSeason;
   const episode = parsed.episode ?? oldEpisode;
@@ -233,7 +278,7 @@ function getMovieInfo(movie) {
     season,
     episode,
     part,
-    type: season !== null
+    type: season !== null || episode !== null
       ? "series"
       : part !== null
         ? "part"
@@ -244,12 +289,13 @@ function getMovieInfo(movie) {
 }
 
 // =====================================================
-// 7. REGISTER USERS
+// 6. REGISTER USERS
 // =====================================================
 
 bot.use(async (ctx, next) => {
   if (ctx.chat?.type === "private" && ctx.from) {
     const userId = Number(ctx.from.id);
+
     const existing = users.find(user => user.id === userId);
 
     if (!existing) {
@@ -267,7 +313,7 @@ bot.use(async (ctx, next) => {
 });
 
 // =====================================================
-// 8. RECEIVE VIDEOS FROM CHANNELS
+// 7. RECEIVE VIDEOS FROM CHANNELS
 // =====================================================
 
 bot.on("channel_post", ctx => {
@@ -277,8 +323,8 @@ bot.on("channel_post", ctx => {
     ? "@" + ctx.chat.username.toLowerCase()
     : "";
 
-  const allowed = CHANNELS.some(
-    channel => channel.username.toLowerCase() === channelUsername
+  const allowed = CHANNELS.some(channel =>
+    channel.username.toLowerCase() === channelUsername
   );
 
   if (!allowed) return;
@@ -305,7 +351,7 @@ bot.on("channel_post", ctx => {
   const parsed = parseCaption(caption);
 
   if (!parsed.key) {
-    console.log("Video title not detected:", caption);
+    console.log("Title not detected:", caption);
     return;
   }
 
@@ -338,17 +384,26 @@ bot.on("channel_post", ctx => {
 
   saveMovies();
 
-  console.log("Movie saved:", parsed.title, channelUsername);
+  console.log(
+    "Saved:",
+    parsed.title,
+    parsed.season ? "Season " + parsed.season : "",
+    parsed.episode ? "Episode " + parsed.episode : "",
+    parsed.part ? "Part " + parsed.part : ""
+  );
 });
 
 // =====================================================
-// 9. SUBSCRIPTION CHECK
+// 8. SUBSCRIPTION CHECK
 // =====================================================
 
 async function isJoined(userId) {
   for (const channel of CHANNELS) {
     try {
-      const member = await bot.telegram.getChatMember(channel.username, userId);
+      const member = await bot.telegram.getChatMember(
+        channel.username,
+        userId
+      );
 
       const joined =
         ["creator", "administrator", "member"].includes(member.status) ||
@@ -378,31 +433,41 @@ async function showJoin(ctx) {
 }
 
 // =====================================================
-// 10. START
+// 9. START
 // =====================================================
 
 bot.start(async ctx => {
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
   return ctx.reply(
-    "🎬 Ku soo dhowow American Films!\n\nQor magaca filimka aad rabto."
+    "🎬 Ku soo dhowow American Somali Films!\n\n" +
+    "Qor magaca filimka ama musalsalka aad rabto."
   );
 });
 
 bot.action("check_join", async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) return showJoin(ctx);
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
 
-  return ctx.reply("✅ Waa lagu xaqiijiyay!\n\nHadda qor magaca filimka.");
+  return ctx.reply(
+    "✅ Waa lagu xaqiijiyay!\n\nHadda qor magaca filimka."
+  );
 });
 
 // =====================================================
-// 11. FUZZY SEARCH
+// 10. FUZZY SEARCH
 // =====================================================
 
 function distance(a, b) {
-  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  const row = Array.from(
+    { length: b.length + 1 },
+    (_, i) => i
+  );
 
   for (let i = 1; i <= a.length; i++) {
     let previous = row[0];
@@ -453,15 +518,15 @@ function similarity(query, title) {
   const average =
     matched.reduce((sum, value) => sum + value, 0) / matched.length;
 
-  const allMatch = matched.every(value => value >= 0.72);
-
-  if (allMatch) return Math.min(0.92, average);
+  if (matched.every(value => value >= 0.72)) {
+    return Math.min(0.92, average);
+  }
 
   return average * 0.85;
 }
 
 // =====================================================
-// 12. DUPLICATE FILTERING
+// 11. REMOVE DUPLICATE EPISODES AND PARTS
 // =====================================================
 
 function newestRecord(a, b) {
@@ -480,21 +545,35 @@ function uniqueEpisodes(records) {
 
   for (const movie of records) {
     const info = getMovieInfo(movie);
+
     const season = Number(info.season);
     const episode = Number(info.episode);
 
-    if (!Number.isFinite(season) || !Number.isFinite(episode)) continue;
+    if (
+      !Number.isFinite(season) ||
+      !Number.isFinite(episode) ||
+      season <= 0 ||
+      episode <= 0
+    ) continue;
 
     const key = `${season}:${episode}`;
     const previous = unique.get(key);
 
-    unique.set(key, previous ? newestRecord(previous, movie) : movie);
+    unique.set(
+      key,
+      previous ? newestRecord(previous, movie) : movie
+    );
   }
 
-  return [...unique.values()].sort((a, b) =>
-    Number(getMovieInfo(a).season) - Number(getMovieInfo(b).season) ||
-    Number(getMovieInfo(a).episode) - Number(getMovieInfo(b).episode)
-  );
+  return [...unique.values()].sort((a, b) => {
+    const A = getMovieInfo(a);
+    const B = getMovieInfo(b);
+
+    return (
+      Number(A.season) - Number(B.season) ||
+      Number(A.episode) - Number(B.episode)
+    );
+  });
 }
 
 function uniqueParts(records) {
@@ -508,20 +587,25 @@ function uniqueParts(records) {
 
     const previous = unique.get(part);
 
-    unique.set(part, previous ? newestRecord(previous, movie) : movie);
+    unique.set(
+      part,
+      previous ? newestRecord(previous, movie) : movie
+    );
   }
 
   return [...unique.values()].sort((a, b) =>
-    Number(getMovieInfo(a).part) - Number(getMovieInfo(b).part)
+    Number(getMovieInfo(a).part) -
+    Number(getMovieInfo(b).part)
   );
 }
 
 // =====================================================
-// 13. FIND MOVIES
+// 12. FIND MOVIES
 // =====================================================
 
 function findMovies(query) {
   const parsedQuery = parseCaption(query);
+
   const q = parsedQuery.key || canonicalTitle(query);
 
   const groups = new Map();
@@ -558,8 +642,8 @@ function findMovies(query) {
 
   if (parsedQuery.part !== null) {
     const matching = results.filter(group =>
-      uniqueParts(group.records).some(
-        movie => Number(getMovieInfo(movie).part) === parsedQuery.part
+      uniqueParts(group.records).some(movie =>
+        Number(getMovieInfo(movie).part) === parsedQuery.part
       )
     );
 
@@ -590,7 +674,7 @@ function findMovies(query) {
 }
 
 // =====================================================
-// 14. SEND ONE VIDEO
+// 13. SEND ONE VIDEO
 // =====================================================
 
 async function sendVideo(ctx, movie) {
@@ -612,22 +696,22 @@ async function sendVideo(ctx, movie) {
 }
 
 // =====================================================
-// 15. OPEN MOVIE / SERIES WITH POSTER
+// 14. OPEN MOVIE / SERIES / PARTS
 // =====================================================
 
 async function openMovie(ctx, group, requested = {}) {
   const records = group.records;
 
-  // Specific Part
+  // Specific Part search
   if (requested.part !== null && requested.part !== undefined) {
-    const selected = uniqueParts(records).find(
-      movie => Number(getMovieInfo(movie).part) === Number(requested.part)
+    const selected = uniqueParts(records).find(movie =>
+      Number(getMovieInfo(movie).part) === Number(requested.part)
     );
 
     if (selected) return sendVideo(ctx, selected);
   }
 
-  // Specific Episode
+  // Specific Episode search
   if (requested.episode !== null && requested.episode !== undefined) {
     const selected = uniqueEpisodes(records).find(movie => {
       const info = getMovieInfo(movie);
@@ -644,19 +728,15 @@ async function openMovie(ctx, group, requested = {}) {
     if (selected) return sendVideo(ctx, selected);
   }
 
-  // Get poster from TMDB
-  const poster = await getTmdbPoster(group.title);
-
-  // SERIES
-  const episodes = uniqueEpisodes(records.filter(movie => {
-    const info = getMovieInfo(movie);
-
-    return info.season !== null && info.episode !== null;
-  }));
+  const episodes = uniqueEpisodes(records);
 
   if (episodes.length) {
     const seasons = [
-      ...new Set(episodes.map(movie => Number(getMovieInfo(movie).season)))
+      ...new Set(
+        episodes.map(movie =>
+          Number(getMovieInfo(movie).season)
+        )
+      )
     ].sort((a, b) => a - b);
 
     sessions.set(ctx.from.id, {
@@ -665,27 +745,20 @@ async function openMovie(ctx, group, requested = {}) {
       episodes
     });
 
-    const keyboard = Markup.inlineKeyboard(
-      seasons.map(season => [
-        Markup.button.callback("Season " + season, "season:" + season)
-      ])
-    );
-
-    const caption =
+    return ctx.reply(
       "📺 Musalsalka: " + group.title +
-      "\n\nDooro xilliga (Season):";
-
-    if (poster) {
-      return ctx.replyWithPhoto(poster, {
-        caption,
-        ...keyboard
-      });
-    }
-
-    return ctx.reply(caption, keyboard);
+      "\n\nDooro xilliga (Season):",
+      Markup.inlineKeyboard(
+        seasons.map(season => [
+          Markup.button.callback(
+            "Season " + season,
+            "season:" + season
+          )
+        ])
+      )
+    );
   }
 
-  // PARTS
   const parts = uniqueParts(records);
 
   if (parts.length) {
@@ -694,55 +767,44 @@ async function openMovie(ctx, group, requested = {}) {
       records: parts
     });
 
-    const keyboard = Markup.inlineKeyboard(
-      parts.map(movie => [
-        Markup.button.callback(
-          "Qeybta " + getMovieInfo(movie).part,
-          "part:" + movie.id
-        )
-      ])
+    return ctx.reply(
+      "🎬 " + group.title + "\n\nDooro qaybta:",
+      Markup.inlineKeyboard(
+        parts.map(movie => [
+          Markup.button.callback(
+            "Qeybta " + getMovieInfo(movie).part,
+            "part:" + movie.id
+          )
+        ])
+      )
     );
-
-    const caption =
-      "🎬 Filimka: " + group.title +
-      "\n\nDooro qaybta:";
-
-    if (poster) {
-      return ctx.replyWithPhoto(poster, {
-        caption,
-        ...keyboard
-      });
-    }
-
-    return ctx.reply(caption, keyboard);
   }
 
-  // NORMAL MOVIE
-  const movie = records[records.length - 1];
-
-  if (poster) {
-    await ctx.replyWithPhoto(poster, {
-      caption: "🎬 " + group.title
-    });
-  }
-
-  return sendVideo(ctx, movie);
+  return sendVideo(ctx, records[records.length - 1]);
 }
 
 // =====================================================
-// 16. ADMIN BROADCAST
+// 15. ADMIN BROADCAST
 // =====================================================
 
 async function broadcastMessage(ctx, messageId) {
   let sent = 0;
   let failed = 0;
+
   const total = users.length;
 
-  await ctx.reply("⏳ Broadcast ayaa bilaabanaya.\nUsers: " + total);
+  await ctx.reply(
+    "⏳ Broadcast ayaa bilaabanaya.\nUsers: " + total
+  );
 
   for (const user of users) {
     try {
-      await ctx.telegram.copyMessage(user.id, ctx.chat.id, messageId);
+      await ctx.telegram.copyMessage(
+        user.id,
+        ctx.chat.id,
+        messageId
+      );
+
       sent++;
 
       await new Promise(resolve => setTimeout(resolve, 40));
@@ -778,7 +840,7 @@ bot.command("broadcast", async ctx => {
   if (!message) {
     return ctx.reply(
       "📢 Qoraal:\n/broadcast Fariintaada\n\n" +
-      "Voice, sawir ama video: reply saar fariinta kadib qor /broadcast."
+      "Sawir, Voice ama Video: reply saar fariinta kadib qor /broadcast."
     );
   }
 
@@ -810,7 +872,7 @@ bot.command("broadcast", async ctx => {
 });
 
 // =====================================================
-// 17. VOICE / AUDIO / VIDEO NOTE BROADCAST
+// 16. VOICE / AUDIO / VIDEO NOTE BROADCAST
 // =====================================================
 
 async function prepareVoiceBroadcast(ctx) {
@@ -826,8 +888,18 @@ async function prepareVoiceBroadcast(ctx) {
     "Codkaaga waxaa loo diri doonaa dhammaan users-ka bot-ka.\n\n" +
     "👥 Users: " + users.length + "\n\nMa rabtaa inaad dirto?",
     Markup.inlineKeyboard([
-      [Markup.button.callback("✅ Haa, dhammaan u dir", "voice_broadcast_yes")],
-      [Markup.button.callback("❌ Jooji", "voice_broadcast_no")]
+      [
+        Markup.button.callback(
+          "✅ Haa, dhammaan u dir",
+          "voice_broadcast_yes"
+        )
+      ],
+      [
+        Markup.button.callback(
+          "❌ Jooji",
+          "voice_broadcast_no"
+        )
+      ]
     ])
   );
 }
@@ -892,7 +964,7 @@ bot.action("voice_broadcast_no", async ctx => {
 });
 
 // =====================================================
-// 18. ADMIN STATISTICS
+// 17. ADMIN STATISTICS
 // =====================================================
 
 bot.command("stats", async ctx => {
@@ -930,7 +1002,9 @@ bot.command("stats", async ctx => {
     users.filter(user => inLastMonth(user.firstSeen)).length;
 
   const lastMonthMovies =
-    movies.filter(movie => inLastMonth(movie.savedAt || movie.createdAt)).length;
+    movies.filter(movie =>
+      inLastMonth(movie.savedAt || movie.createdAt)
+    ).length;
 
   const monthName = startLastMonth.toLocaleString("en-US", {
     month: "long",
@@ -942,13 +1016,17 @@ bot.command("stats", async ctx => {
     users.filter(user => !user.firstSeen).length;
 
   const channelOneMovies =
-    movies.filter(movie => movie.sourceChannel === "@vexoramovies").length;
+    movies.filter(movie =>
+      movie.sourceChannel === "@vexoramovies"
+    ).length;
 
   const channelTwoMovies =
-    movies.filter(movie => movie.sourceChannel === "@somalifilm0").length;
+    movies.filter(movie =>
+      movie.sourceChannel === "@somalifilm0"
+    ).length;
 
   return ctx.reply(
-    "📊 AMERICAN FILMS STATISTICS\n\n" +
+    "📊 AMERICAN SOMALI FILMS STATISTICS\n\n" +
     "👥 ALL TIME USERS: " + users.length + "\n" +
     "📅 LAST MONTH USERS (" + monthName + "): " + lastMonthUsers + "\n" +
     "❓ Old users without date: " + oldUsersWithoutDate + "\n\n" +
@@ -960,7 +1038,7 @@ bot.command("stats", async ctx => {
 });
 
 // =====================================================
-// 19. SEARCH HANDLER
+// 18. SEARCH HANDLER
 // =====================================================
 
 bot.on("text", async ctx => {
@@ -1002,14 +1080,17 @@ bot.on("text", async ctx => {
     "🎬 Filimadan ayaa ugu dhow magaca aad qortay. Mid dooro:",
     Markup.inlineKeyboard(
       results.map((group, index) => [
-        Markup.button.callback(group.title, "title:" + index)
+        Markup.button.callback(
+          group.title,
+          "title:" + index
+        )
       ])
     )
   );
 });
 
 // =====================================================
-// 20. SELECT TITLE
+// 19. SELECT TITLE
 // =====================================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
@@ -1031,11 +1112,15 @@ bot.action(/^title:(\d+)$/, async ctx => {
     return ctx.reply("Filimka lama helin.");
   }
 
-  return openMovie(ctx, group, session.requested || {});
+  return openMovie(
+    ctx,
+    group,
+    session.requested || {}
+  );
 });
 
 // =====================================================
-// 21. SELECT SEASON
+// 20. SELECT SEASON
 // =====================================================
 
 bot.action(/^season:(\d+)$/, async ctx => {
@@ -1054,7 +1139,9 @@ bot.action(/^season:(\d+)$/, async ctx => {
   const season = Number(ctx.match[1]);
 
   const episodes = uniqueEpisodes(session.episodes)
-    .filter(movie => Number(getMovieInfo(movie).season) === season);
+    .filter(movie =>
+      Number(getMovieInfo(movie).season) === season
+    );
 
   if (!episodes.length) {
     return ctx.reply("Season-kan lama helin.");
@@ -1076,7 +1163,7 @@ bot.action(/^season:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 22. SELECT EPISODE
+// 21. SELECT EPISODE
 // =====================================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
@@ -1092,8 +1179,8 @@ bot.action(/^episode:(\d+)$/, async ctx => {
     return ctx.reply("Fadlan mar kale raadi series-ka.");
   }
 
-  const movie = (session.selectedEpisodes || []).find(
-    item => Number(item.id) === Number(ctx.match[1])
+  const movie = (session.selectedEpisodes || []).find(item =>
+    Number(item.id) === Number(ctx.match[1])
   );
 
   if (!movie) {
@@ -1104,7 +1191,7 @@ bot.action(/^episode:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 23. SELECT PART
+// 22. SELECT PART
 // =====================================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
@@ -1120,8 +1207,8 @@ bot.action(/^part:(\d+)$/, async ctx => {
     return ctx.reply("Fadlan mar kale raadi filimka.");
   }
 
-  const movie = session.records.find(
-    item => Number(item.id) === Number(ctx.match[1])
+  const movie = session.records.find(item =>
+    Number(item.id) === Number(ctx.match[1])
   );
 
   if (!movie) {
@@ -1132,7 +1219,7 @@ bot.action(/^part:(\d+)$/, async ctx => {
 });
 
 // =====================================================
-// 24. ERROR HANDLING
+// 23. ERROR HANDLING
 // =====================================================
 
 bot.catch(error => {
@@ -1140,19 +1227,24 @@ bot.catch(error => {
 });
 
 // =====================================================
-// 25. START BOT
+// 24. START BOT
 // =====================================================
 
 bot.launch({
-  allowedUpdates: ["message", "callback_query", "channel_post"]
+  allowedUpdates: [
+    "message",
+    "callback_query",
+    "channel_post"
+  ]
+}).then(() => {
+  console.log("American Somali Films Bot is running!");
+  console.log("Listening to both movie channels.");
+  console.log("Series Season and Episode system enabled.");
+  console.log("Duplicate Part filtering enabled.");
+}).catch(error => {
+  console.error("BOT LAUNCH ERROR:", error);
+  process.exit(1);
 });
-
-console.log("American Films Bot is running!");
-console.log("TMDB poster search:", TMDB_API_KEY ? "Enabled" : "Missing API key");
-console.log("Listening to both movie channels.");
-console.log("Smart Movie Search enabled.");
-console.log("Duplicate filtering enabled.");
-console.log("Voice Broadcast enabled.");
 
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
