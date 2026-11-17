@@ -1,3 +1,4 @@
+
 'use strict';
 
 const { Telegraf, Markup } = require('telegraf');
@@ -40,6 +41,10 @@ const SOURCES = [
   'referral'
 ];
 
+const TMDB_CACHE_TIME = 6 * 60 * 60 * 1000;
+const TMDB_TIMEOUT = 5000;
+const JOIN_CACHE_TIME = 45 * 1000;
+
 if (!BOT_TOKEN) {
   throw new Error('BOT TOKEN IS MISSING');
 }
@@ -51,7 +56,9 @@ const USERS_DB = path.join(__dirname, 'users.json');
 
 const sessions = new Map();
 const pendingBroadcasts = new Map();
+
 const tmdbCache = new Map();
+const joinCache = new Map();
 
 
 // =====================================================
@@ -63,8 +70,6 @@ function loadArray(file, property) {
 
   const content = fs.readFileSync(file, 'utf8').trim();
 
-  // Empty or invalid JSON is not silently replaced:
-  // this prevents accidental loss of existing data.
   if (!content) {
     throw new Error(
       'Database file is empty: ' + path.basename(file) +
@@ -160,10 +165,12 @@ function getOrCreateUser(userId) {
   let user = getUser(userId);
 
   if (!user) {
+    const now = new Date().toISOString();
+
     user = {
       id: Number(userId),
-      firstSeen: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
+      firstSeen: now,
+      lastActiveAt: now,
       favorites: [],
       referralCount: 0,
       referredBy: null,
@@ -207,8 +214,6 @@ function validSource(source) {
 }
 
 function processNewReferral(user, payload) {
-  // 'unknown' is the default value for a new user.
-  // Allow it to be replaced by a real source/referral.
   if (
     !payload ||
     user.referredBy ||
@@ -250,9 +255,7 @@ function processNewReferral(user, payload) {
       inviterId = null;
     }
   } else if (sourceMatch) {
-    source = validSource(
-      sourceMatch[1].toLowerCase()
-    );
+    source = validSource(sourceMatch[1].toLowerCase());
   }
 
   user.firstSource = source;
@@ -316,6 +319,7 @@ function getTopReferrers(limit = 10) {
 
 // =====================================================
 // 4. USER ACTIVITY TRACKING
+// Save only when data changes.
 // =====================================================
 
 bot.use(async (ctx, next) => {
@@ -325,25 +329,36 @@ bot.use(async (ctx, next) => {
     ctx.state.isNewUser = !existing;
 
     const user = getOrCreateUser(ctx.from.id);
+    let changed = false;
 
-    // Keep Telegram profile information for statistics.
-    user.firstName = ctx.from.first_name || user.firstName || '';
-    user.username = ctx.from.username || user.username || '';
+    const firstName = ctx.from.first_name || '';
+    const username = ctx.from.username || '';
+
+    if (user.firstName !== firstName) {
+      user.firstName = firstName;
+      changed = true;
+    }
+
+    if (user.username !== username) {
+      user.username = username;
+      changed = true;
+    }
 
     const now = new Date();
     const last = user.lastActiveAt
       ? new Date(user.lastActiveAt)
       : null;
 
-    // Save activity at most once per hour.
     if (
       !last ||
       !Number.isFinite(last.getTime()) ||
       now.getTime() - last.getTime() >= 60 * 60 * 1000
     ) {
       user.lastActiveAt = now.toISOString();
-      saveUsers();
-    } else {
+      changed = true;
+    }
+
+    if (changed) {
       saveUsers();
     }
   }
@@ -631,30 +646,62 @@ bot.on('channel_post', ctx => {
 
 
 // =====================================================
-// 8. SUBSCRIBE CHECK
+// 8. SUBSCRIBE CHECK - PARALLEL + CACHE
 // =====================================================
 
-async function isJoined(userId) {
-  for (const channel of CHANNELS) {
-    try {
-      const member = await bot.telegram.getChatMember(
-        channel.username,
-        userId
-      );
+async function isJoined(userId, forceCheck = false) {
+  const id = Number(userId);
 
-      const joined =
-        ['creator', 'administrator', 'member'].includes(member.status) ||
-        (member.status === 'restricted' && member.is_member);
+  const cached = joinCache.get(id);
 
-      if (!joined) return false;
+  if (
+    !forceCheck &&
+    cached &&
+    Date.now() - cached.time < JOIN_CACHE_TIME
+  ) {
+    return cached.joined;
+  }
 
-    } catch (error) {
-      console.error('JOIN CHECK:', error.message);
-      return false;
+  const results = await Promise.all(
+    CHANNELS.map(async channel => {
+      try {
+        const member = await bot.telegram.getChatMember(
+          channel.username,
+          id
+        );
+
+        return (
+          ['creator', 'administrator', 'member'].includes(member.status) ||
+          (member.status === 'restricted' && member.is_member)
+        );
+      } catch (error) {
+        console.error(
+          'JOIN CHECK:',
+          channel.username,
+          error.message
+        );
+
+        return false;
+      }
+    })
+  );
+
+  const joined = results.every(Boolean);
+
+  joinCache.set(id, {
+    joined,
+    time: Date.now()
+  });
+
+  if (joinCache.size > 10000) {
+    for (const [key, value] of joinCache) {
+      if (Date.now() - value.time > JOIN_CACHE_TIME) {
+        joinCache.delete(key);
+      }
     }
   }
 
-  return true;
+  return joined;
 }
 
 async function showJoin(ctx) {
@@ -695,7 +742,7 @@ bot.start(async ctx => {
   }
 
   return ctx.reply(
-    '🎬 Ku soo dhowow American Somali Films!\n\n' +
+    '🎬 Ku soo dhowow SOMALI BOT!\n\n' +
     'Qor magaca filimka ama musalsalka aad rabto.\n\n' +
     '⭐ /favorites - Filimada aad kaydsatay\n' +
     'ℹ️ /help - Caawimaad'
@@ -705,7 +752,9 @@ bot.start(async ctx => {
 bot.action('check_join', async ctx => {
   await ctx.answerCbQuery();
 
-  if (!(await isJoined(ctx.from.id))) {
+  joinCache.delete(Number(ctx.from.id));
+
+  if (!(await isJoined(ctx.from.id, true))) {
     return showJoin(ctx);
   }
 
@@ -743,7 +792,7 @@ bot.command('invite', async ctx => {
           'https://t.me/share/url?url=' +
           encodeURIComponent(link) +
           '&text=' +
-          encodeURIComponent('Ku soo biir American Somali Films 🎬')
+          encodeURIComponent('Ku soo biir SOMALI BOT 🎬')
         )
       ]
     ])
@@ -1059,7 +1108,7 @@ function findMovies(query) {
 
 
 // =====================================================
-// 14. TMDB POSTER AND INFORMATION
+// 14. TMDB - TOP 5 + 6 HOUR CACHE + TIMEOUT
 // =====================================================
 
 const GENRES = {
@@ -1084,14 +1133,67 @@ const GENRES = {
   37: 'Western'
 };
 
+function getCachedTMDB(key) {
+  const cached = tmdbCache.get(key);
+
+  if (!cached) return undefined;
+
+  if (Date.now() - cached.time >= TMDB_CACHE_TIME) {
+    tmdbCache.delete(key);
+    return undefined;
+  }
+
+  return cached.value;
+}
+
+function setCachedTMDB(key, value) {
+  tmdbCache.set(key, {
+    value,
+    time: Date.now()
+  });
+
+  if (tmdbCache.size > 2000) {
+    for (const [cacheKey, entry] of tmdbCache) {
+      if (Date.now() - entry.time >= TMDB_CACHE_TIME) {
+        tmdbCache.delete(cacheKey);
+      }
+    }
+  }
+}
+
+async function fetchTMDB(url) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, TMDB_TIMEOUT);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error('TMDB HTTP ' + response.status);
+    }
+
+    return await response.json();
+
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function getTMDBInfo(title, kind) {
   if (!TMDB_API_KEY) return null;
 
   const category = kind === 'series' ? 'tv' : 'movie';
   const cacheKey = category + ':' + normalize(title);
 
-  if (tmdbCache.has(cacheKey)) {
-    return tmdbCache.get(cacheKey);
+  const cached = getCachedTMDB(cacheKey);
+
+  if (cached !== undefined) {
+    return cached;
   }
 
   try {
@@ -1101,16 +1203,13 @@ async function getTMDBInfo(title, kind) {
       `&query=${encodeURIComponent(title)}` +
       '&include_adult=false';
 
-    const response = await fetch(url);
+    const data = await fetchTMDB(url);
 
-    if (!response.ok) {
-      throw new Error('TMDB HTTP ' + response.status);
-    }
+    // The first five results are evaluated together.
+    const firstFive = (data.results || []).slice(0, 5);
 
-    const data = await response.json();
-
-    const results = (data.results || [])
-      .map(item => {
+    const scored = await Promise.all(
+      firstFive.map(async item => {
         const name = item.title || item.name || '';
 
         return {
@@ -1121,9 +1220,11 @@ async function getTMDBInfo(title, kind) {
           )
         };
       })
-      .sort((a, b) => b.score - a.score);
+    );
 
-    const best = results[0];
+    scored.sort((a, b) => b.score - a.score);
+
+    const best = scored[0];
 
     const result =
       best && best.score >= 0.45
@@ -1142,7 +1243,7 @@ async function getTMDBInfo(title, kind) {
           }
         : null;
 
-    tmdbCache.set(cacheKey, result);
+    setCachedTMDB(cacheKey, result);
 
     return result;
 
@@ -1173,6 +1274,12 @@ function formatMovieCaption(title, info, extra = '') {
 
   return text.slice(0, 1020);
 }
+
+
+// =====================================================
+// 15. POSTER MENU
+// Used ONLY for Parts and Series.
+// =====================================================
 
 async function sendPosterMenu(
   ctx,
@@ -1205,18 +1312,17 @@ async function sendPosterMenu(
   }
 
   return ctx.reply(
-    caption +
-    '\n\n🖼️ Poster lama helin. Isticmaal badhanka hoose.',
+    caption,
     keyboard
   );
 }
 
 
 // =====================================================
-// 15. SEND VIDEO
+// 16. SEND VIDEO DIRECTLY
 // =====================================================
 
-async function sendVideo(ctx, record, groupTitle) {
+async function sendVideo(ctx, record, groupTitle, groupKey) {
   try {
     await ctx.sendChatAction('upload_video');
 
@@ -1236,14 +1342,25 @@ async function sendVideo(ctx, record, groupTitle) {
       caption += ` - Part ${info.part}`;
     }
 
+    const options = {
+      caption,
+      parse_mode: undefined
+    };
+
+    // Keep Favorites available without sending another message.
+    if (groupKey) {
+      options.reply_markup = Markup.inlineKeyboard([
+        [
+          favoriteButton(ctx.from.id, groupKey)
+        ]
+      ]).reply_markup;
+    }
+
     await ctx.telegram.copyMessage(
       ctx.chat.id,
       record.chatId,
       record.messageId,
-      {
-        caption,
-        parse_mode: undefined
-      }
+      options
     );
 
   } catch (error) {
@@ -1257,7 +1374,7 @@ async function sendVideo(ctx, record, groupTitle) {
 
 
 // =====================================================
-// 16. FAVORITES
+// 17. FAVORITES
 // =====================================================
 
 function isFavorite(userId, key) {
@@ -1323,9 +1440,9 @@ bot.command('favorites', async ctx => {
   return ctx.reply(
     '❤️ FILIMADA AAD JECESHAHAY\n\nDooro filimka:',
     Markup.inlineKeyboard(
-      groups.map((group, index) => [
+      groups.slice(0, 50).map((group, index) => [
         Markup.button.callback(
-          '🎬 ' + group.title,
+          '🎬 ' + group.title.slice(0, 45),
           'favorite:open:' + index
         )
       ])
@@ -1347,10 +1464,10 @@ bot.action('favorite:toggle', async ctx => {
     session.group.key
   );
 
-  return ctx.reply(
+  return ctx.answerCbQuery(
     saved
-      ? '❤️ Filimka Favorites ayaa lagu daray.'
-      : '🗑️ Filimka Favorites waa laga saaray.'
+      ? '❤️ Favorites ayaa lagu daray.'
+      : '🗑️ Favorites waa laga saaray.'
   );
 });
 
@@ -1376,10 +1493,11 @@ bot.action(/^favorite:open:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 17. OPEN TITLE / SEASON / EPISODE
+// 18. OPEN TITLE / SEASON / EPISODE
 // =====================================================
 
 async function openGroup(ctx, group, requested = {}) {
+  // Requested episode: send video immediately.
   if (
     requested.episode !== null &&
     requested.episode !== undefined
@@ -1397,10 +1515,21 @@ async function openGroup(ctx, group, requested = {}) {
     });
 
     if (chosen) {
-      return sendVideo(ctx, chosen, group.title);
+      sessions.set(ctx.from.id, {
+        type: 'selected',
+        group
+      });
+
+      return sendVideo(
+        ctx,
+        chosen,
+        group.title,
+        group.key
+      );
     }
   }
 
+  // Requested part: send video immediately.
   if (
     requested.part !== null &&
     requested.part !== undefined
@@ -1411,10 +1540,21 @@ async function openGroup(ctx, group, requested = {}) {
     );
 
     if (chosen) {
-      return sendVideo(ctx, chosen, group.title);
+      sessions.set(ctx.from.id, {
+        type: 'selected',
+        group
+      });
+
+      return sendVideo(
+        ctx,
+        chosen,
+        group.title,
+        group.key
+      );
     }
   }
 
+  // SERIES: one poster, then seasons.
   if (group.kind === 'series') {
     const seasons = [
       ...new Set(
@@ -1429,7 +1569,9 @@ async function openGroup(ctx, group, requested = {}) {
     sessions.set(ctx.from.id, {
       type: 'series',
       group,
-      selectedSeason: null
+      selectedSeason: null,
+      menuMessageId: null,
+      menuChatId: ctx.chat.id
     });
 
     const keyboard = Markup.inlineKeyboard([
@@ -1442,15 +1584,25 @@ async function openGroup(ctx, group, requested = {}) {
       [favoriteButton(ctx.from.id, group.key)]
     ]);
 
-    return sendPosterMenu(
+    const message = await sendPosterMenu(
       ctx,
       group.title,
       'series',
       keyboard,
       '📺 Musalsalka\n\nDooro Season-ka:'
     );
+
+    const session = sessions.get(ctx.from.id);
+
+    if (session) {
+      session.menuMessageId = message.message_id;
+      session.menuChatId = message.chat.id;
+    }
+
+    return message;
   }
 
+  // PARTS: one poster, then Part buttons.
   if (group.kind === 'parts') {
     sessions.set(ctx.from.id, {
       type: 'parts',
@@ -1476,6 +1628,7 @@ async function openGroup(ctx, group, requested = {}) {
     );
   }
 
+  // SINGLE MOVIE: video immediately, no poster/menu.
   const record = group.records.reduce(
     (best, current) => newestRecord(best, current)
   );
@@ -1486,33 +1639,19 @@ async function openGroup(ctx, group, requested = {}) {
     record
   });
 
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        '▶️ Daawo Filimka',
-        'movie:' + record.id
-      )
-    ],
-    [favoriteButton(ctx.from.id, group.key)]
-  ]);
-
-  return sendPosterMenu(
+  return sendVideo(
     ctx,
+    record,
     group.title,
-    'movie',
-    keyboard,
-    '🎬 Taabo badhanka si aad u daawato.'
+    group.key
   );
 }
 
 
 // =====================================================
-// 18. TEXT SEARCH - FIXED COMMAND HANDLING
+// 19. TEXT SEARCH
+// No posters in search results.
 // =====================================================
-
-// IMPORTANT:
-// Commands must continue to the command handlers below.
-// Without next(), /stats, /help and /favorites get blocked here.
 
 bot.on('text', async (ctx, next) => {
   const query = ctx.message.text.trim();
@@ -1554,68 +1693,35 @@ bot.on('text', async (ctx, next) => {
       best.score - second.score >= 0.08
     );
 
+  // Exact or highly confident match: open directly.
   if (exactMatch || strongMatch) {
     return openGroup(ctx, best, parsed);
   }
 
+  // Ambiguous results: one short text message with buttons.
   sessions.set(ctx.from.id, {
     type: 'titles',
     groups: results,
     requested: parsed
   });
 
-  await ctx.reply(
-    '🎬 Waxaan helay filimo dhow.\n' +
-    'Dooro midka aad raadineyso:'
+  const buttons = results.map((group, index) => [
+    Markup.button.callback(
+      '🎬 ' + group.title.slice(0, 45),
+      'title:' + index
+    )
+  ]);
+
+  return ctx.reply(
+    '🎬 Magacyo dhow ayaa la helay.\n\n' +
+    'Dooro filimka aad rabto:',
+    Markup.inlineKeyboard(buttons)
   );
-
-  for ( let i = 0; i < results.length; i++) {
-    const group = results[i];
-
-    const info = await getTMDBInfo(
-      group.title,
-      group.kind === 'series' ? 'series' : 'movie'
-    );
-
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback(
-          '✅ Dooro ' + group.title.slice(0, 35),
-          'title:' + i
-        )
-      ]
-    ]);
-
-    if (info?.poster) {
-      try {
-        await ctx.replyWithPhoto(
-          info.poster,
-          {
-            caption: formatMovieCaption(
-              group.title,
-              info
-            ),
-            reply_markup: keyboard.reply_markup
-          }
-        );
-
-        continue;
-
-      } catch (error) {
-        console.error('SEARCH POSTER:', error.message);
-      }
-    }
-
-    await ctx.reply(
-      '🎬 ' + group.title,
-      keyboard
-    );
-  }
 });
 
 
 // =====================================================
-// 19. TITLE BUTTON
+// 20. TITLE BUTTON
 // =====================================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
@@ -1644,50 +1750,39 @@ bot.action(/^title:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 20. MOVIE BUTTON
+// 21. SEASON BUTTON
+// Edit the SAME poster message.
 // =====================================================
 
-bot.action(/^movie:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery();
+async function editSeasonMenu(ctx, session, season, keyboard) {
+  const text =
+    '📺 ' + session.group.title +
+    '\nSeason ' + season +
+    '\n\nDooro Episode-ka:';
 
-  if (!(await isJoined(ctx.from.id))) {
-    return showJoin(ctx);
-  }
+  try {
+    if (ctx.callbackQuery.message?.photo) {
+      return await ctx.editMessageCaption(
+        text,
+        keyboard
+      );
+    }
 
-  const movieId = Number(ctx.match[1]);
-  const session = sessions.get(ctx.from.id);
-
-  let record = null;
-  let title = '';
-
-  if (
-    session &&
-    session.type === 'single' &&
-    Number(session.record.id) === movieId
-  ) {
-    record = session.record;
-    title = session.group.title;
-  } else {
-    record = movies.find(movie =>
-      Number(movie.id) === movieId
+    return await ctx.editMessageText(
+      text,
+      keyboard
     );
 
-    if (record) {
-      title = getMovieInfo(record).title;
+  } catch (error) {
+    if (
+      String(error.message).includes('message is not modified')
+    ) {
+      return;
     }
+
+    console.error('SEASON MENU EDIT:', error.message);
   }
-
-  if (!record) {
-    return ctx.reply('Filimkan hadda lama helin.');
-  }
-
-  return sendVideo(ctx, record, title);
-});
-
-
-// =====================================================
-// 21. SEASON BUTTON
-// =====================================================
+}
 
 bot.action(/^season:(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
@@ -1710,7 +1805,10 @@ bot.action(/^season:(\d+)$/, async ctx => {
   );
 
   if (!episodes.length) {
-    return ctx.reply('Season-kan xogtiisa lama helin.');
+    return ctx.answerCbQuery(
+      'Season-kan xogtiisa lama helin.',
+      { show_alert: true }
+    );
   }
 
   session.selectedSeason = season;
@@ -1724,26 +1822,86 @@ bot.action(/^season:(\d+)$/, async ctx => {
     ]),
     [
       Markup.button.callback(
-        '⭐ Favorites',
-        'favorite:toggle'
+        '⬅️ Seasons',
+        'seasons_back'
       )
+    ],
+    [
+      favoriteButton(ctx.from.id, session.group.key)
     ]
   ]);
 
-  return sendPosterMenu(
+  return editSeasonMenu(
     ctx,
-    session.group.title,
-    'series',
-    keyboard,
-    '📺 ' + session.group.title +
-    '\nSeason ' + season +
-    '\n\nDooro Episode-ka:'
+    session,
+    season,
+    keyboard
   );
 });
 
 
 // =====================================================
-// 22. EPISODE BUTTON
+// 22. BACK TO SEASONS
+// Same poster message.
+// =====================================================
+
+bot.action('seasons_back', async ctx => {
+  await ctx.answerCbQuery();
+
+  const session = sessions.get(ctx.from.id);
+
+  if (!session || session.type !== 'series') {
+    return;
+  }
+
+  const seasons = [
+    ...new Set(
+      session.group.episodes.map(record =>
+        Number(getMovieInfo(record).season)
+      )
+    )
+  ]
+    .filter(n => Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+
+  session.selectedSeason = null;
+
+  const keyboard = Markup.inlineKeyboard([
+    ...seasons.map(season => [
+      Markup.button.callback(
+        '📺 Season ' + season,
+        'season:' + season
+      )
+    ]),
+    [favoriteButton(ctx.from.id, session.group.key)]
+  ]);
+
+  const text =
+    '🎬 ' + session.group.title +
+    '\n\n📺 Musalsalka\n\nDooro Season-ka:';
+
+  try {
+    if (ctx.callbackQuery.message?.photo) {
+      return await ctx.editMessageCaption(
+        text,
+        keyboard
+      );
+    }
+
+    return await ctx.editMessageText(
+      text,
+      keyboard
+    );
+
+  } catch (error) {
+    console.error('SEASONS BACK:', error.message);
+  }
+});
+
+
+// =====================================================
+// 23. EPISODE BUTTON
+// Direct video, no new poster/message.
 // =====================================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
@@ -1766,15 +1924,24 @@ bot.action(/^episode:(\d+)$/, async ctx => {
   );
 
   if (!record) {
-    return ctx.reply('Episode-kan lama helin.');
+    return ctx.answerCbQuery(
+      'Episode-kan lama helin.',
+      { show_alert: true }
+    );
   }
 
-  return sendVideo(ctx, record, session.group.title);
+  return sendVideo(
+    ctx,
+    record,
+    session.group.title,
+    session.group.key
+  );
 });
 
 
 // =====================================================
-// 23. PART BUTTON
+// 24. PART BUTTON
+// Direct video.
 // =====================================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
@@ -1794,19 +1961,29 @@ bot.action(/^part:(\d+)$/, async ctx => {
     Number(item.id) === Number(ctx.match[1])
   );
 
-  if (!record) return ctx.reply('Qaybtan lama helin.');
+  if (!record) {
+    return ctx.answerCbQuery(
+      'Qaybtan lama helin.',
+      { show_alert: true }
+    );
+  }
 
-  return sendVideo(ctx, record, session.group.title);
+  return sendVideo(
+    ctx,
+    record,
+    session.group.title,
+    session.group.key
+  );
 });
 
 
 // =====================================================
-// 24. HELP - REQUESTED MESSAGE
+// 25. HELP
 // =====================================================
 
 bot.command('help', async ctx => {
   return ctx.reply(
-    'ℹ️ Caawimaadda American Somali Films\n\n' +
+    'ℹ️ Caawimaadda SOMALI BOT\n\n' +
     'Haddii aad cabasho, su\'aal ama dhibaato qabto, fadlan nagala soo xiriir:\n\n' +
     '📩 Telegram: @Fare252\n\n' +
     '📱 WhatsApp: +2520906949873\n\n' +
@@ -1816,7 +1993,7 @@ bot.command('help', async ctx => {
 
 
 // =====================================================
-// 25. ADMIN BROADCAST
+// 26. ADMIN BROADCAST
 // =====================================================
 
 async function broadcastMessage(ctx, messageId) {
@@ -1929,6 +2106,8 @@ bot.on('voice', prepareMediaBroadcast);
 bot.on('audio', prepareMediaBroadcast);
 bot.on('video_note', prepareMediaBroadcast);
 bot.on('photo', prepareMediaBroadcast);
+bot.on('video', prepareMediaBroadcast);
+bot.on('document', prepareMediaBroadcast);
 
 bot.action('broadcast_yes', async ctx => {
   await ctx.answerCbQuery();
@@ -1956,7 +2135,7 @@ bot.action('broadcast_no', async ctx => {
 
 
 // =====================================================
-// 26. ADMIN STATISTICS
+// 27. ADMIN STATISTICS
 // =====================================================
 
 bot.command('stats', async ctx => {
@@ -2046,7 +2225,7 @@ bot.command('stats', async ctx => {
   }
 
   const message =
-    '📊 AMERICAN SOMALI FILMS\n' +
+    '📊 SOMALI BOT STATISTICS\n' +
     '━━━━━━━━━━━━━━━━━━\n\n' +
 
     '👥 ALL TIME USERS: ' + users.length + '\n' +
@@ -2090,12 +2269,11 @@ bot.command('stats', async ctx => {
 
 
 // =====================================================
-// 27. TELEGRAM MENU
+// 28. TELEGRAM MENU
 // =====================================================
 
 async function setupTelegramMenu() {
   try {
-    // Commands visible to ordinary users.
     await bot.telegram.setMyCommands(
       [
         {
@@ -2122,7 +2300,6 @@ async function setupTelegramMenu() {
       }
     );
 
-    // Admin-only commands.
     await bot.telegram.setMyCommands(
       [
         {
@@ -2155,7 +2332,7 @@ async function setupTelegramMenu() {
 
 
 // =====================================================
-// 28. ERROR HANDLING / STARTUP
+// 29. ERROR HANDLING / STARTUP
 // =====================================================
 
 bot.catch(error => {
@@ -2170,16 +2347,21 @@ bot.launch({
   ]
 })
   .then(async () => {
-    console.log('American Somali Films Bot is running!');
+    console.log('SOMALI BOT is running!');
     console.log('Smart Search: Enabled');
-    console.log('TMDB Posters:', TMDB_API_KEY ? 'Enabled' : 'Missing');
-    console.log('Series: Poster -> Seasons -> Episodes -> Video');
+    console.log('TMDB: Top 5 + 6-hour cache + timeout');
+    console.log('Subscribe: Parallel checks + cache');
+    console.log('Users: Save only when data changes');
+    console.log('Single movie: Direct video');
+    console.log('Search results: Text only');
+    console.log('Parts: One poster -> Parts -> Direct video');
+    console.log('Series: One poster -> Seasons -> Episodes -> Direct video');
     console.log('Favorites: Enabled');
     console.log('Referral Tracking: Enabled');
     console.log('Traffic Tracking: Enabled');
     console.log('Monthly Active Users: Enabled');
     console.log('Admin Stats: Enabled');
-    console.log('Admin Menu: Enabled');
+    console.log('Broadcast: Enabled');
     console.log('Old movies.json and users.json preserved.');
 
     await setupTelegramMenu();
