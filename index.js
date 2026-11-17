@@ -1,4 +1,3 @@
-
 'use strict';
 
 const { Telegraf, Markup } = require('telegraf');
@@ -62,9 +61,28 @@ const tmdbCache = new Map();
 function loadArray(file, property) {
   if (!fs.existsSync(file)) return [];
 
-  const parsed = JSON.parse(
-    fs.readFileSync(file, 'utf8')
-  );
+  const content = fs.readFileSync(file, 'utf8').trim();
+
+  // Empty or invalid JSON is not silently replaced:
+  // this prevents accidental loss of existing data.
+  if (!content) {
+    throw new Error(
+      'Database file is empty: ' + path.basename(file) +
+      '. Restore its backup before starting the bot.'
+    );
+  }
+
+  let parsed;
+
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new Error(
+      'Invalid JSON in ' + path.basename(file) +
+      '. Check the file or restore its .bak backup. ' +
+      error.message
+    );
+  }
 
   if (Array.isArray(parsed)) return parsed;
 
@@ -102,7 +120,9 @@ let users = loadArray(USERS_DB, 'users')
       return {
         id: Number(user),
         firstSeen: null,
-        favorites: []
+        lastActiveAt: null,
+        favorites: [],
+        referralCount: 0
       };
     }
 
@@ -110,6 +130,7 @@ let users = loadArray(USERS_DB, 'users')
       ...user,
       id: Number(user.id),
       firstSeen: user.firstSeen || null,
+      lastActiveAt: user.lastActiveAt || null,
       favorites: Array.isArray(user.favorites)
         ? user.favorites
         : [],
@@ -172,7 +193,9 @@ function getSourceLink(source) {
 function getStartPayload(ctx) {
   const text = ctx.message?.text || '';
 
-  const match = text.match(/^\/start(?:@\w+)?(?:\s+([^\s]+))?/i);
+  const match = text.match(
+    /^\/start(?:@\w+)?(?:\s+([^\s]+))?/i
+  );
 
   return match?.[1] || '';
 }
@@ -184,7 +207,16 @@ function validSource(source) {
 }
 
 function processNewReferral(user, payload) {
-  if (!payload || user.referredBy || user.firstSource) {
+  // 'unknown' is the default value for a new user.
+  // Allow it to be replaced by a real source/referral.
+  if (
+    !payload ||
+    user.referredBy ||
+    (
+      user.firstSource &&
+      user.firstSource !== 'unknown'
+    )
+  ) {
     return;
   }
 
@@ -294,6 +326,10 @@ bot.use(async (ctx, next) => {
 
     const user = getOrCreateUser(ctx.from.id);
 
+    // Keep Telegram profile information for statistics.
+    user.firstName = ctx.from.first_name || user.firstName || '';
+    user.username = ctx.from.username || user.username || '';
+
     const now = new Date();
     const last = user.lastActiveAt
       ? new Date(user.lastActiveAt)
@@ -306,6 +342,8 @@ bot.use(async (ctx, next) => {
       now.getTime() - last.getTime() >= 60 * 60 * 1000
     ) {
       user.lastActiveAt = now.toISOString();
+      saveUsers();
+    } else {
       saveUsers();
     }
   }
@@ -647,7 +685,6 @@ async function showJoin(ctx) {
 bot.start(async ctx => {
   const user = getOrCreateUser(ctx.from.id);
 
-  // Only process referral/source for genuinely new users.
   if (ctx.state.isNewUser) {
     const payload = getStartPayload(ctx);
     processNewReferral(user, payload);
@@ -1470,13 +1507,21 @@ async function openGroup(ctx, group, requested = {}) {
 
 
 // =====================================================
-// 18. TEXT SEARCH
+// 18. TEXT SEARCH - FIXED COMMAND HANDLING
 // =====================================================
 
-bot.on('text', async ctx => {
+// IMPORTANT:
+// Commands must continue to the command handlers below.
+// Without next(), /stats, /help and /favorites get blocked here.
+
+bot.on('text', async (ctx, next) => {
   const query = ctx.message.text.trim();
 
-  if (!query || query.startsWith('/')) return;
+  if (query.startsWith('/')) {
+    return next();
+  }
+
+  if (!query) return;
 
   if (!(await isJoined(ctx.from.id))) {
     return showJoin(ctx);
@@ -1524,7 +1569,7 @@ bot.on('text', async ctx => {
     'Dooro midka aad raadineyso:'
   );
 
-  for (let i = 0; i < results.length; i++) {
+  for ( let i = 0; i < results.length; i++) {
     const group = results[i];
 
     const info = await getTMDBInfo(
@@ -1756,18 +1801,16 @@ bot.action(/^part:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 24. HELP
+// 24. HELP - REQUESTED MESSAGE
 // =====================================================
 
 bot.command('help', async ctx => {
   return ctx.reply(
-    '🎬 AMERICAN SOMALI FILMS\n\n' +
-    '🔎 Qor magaca filimka si aad u raadiso.\n' +
-    '⭐ /favorites - Filimada aad kaydsatay.\n' +
-    '🔗 /invite - Referral link-gaaga.\n' +
-    '🏆 /top - Dadka referrals-ka ugu badan keenay.\n' +
-    'ℹ️ /help - Caawimaad.\n\n' +
-    'Haddii aad qalad ku qorto magaca, bot-ku wuxuu isku dayayaa inuu fahmo.'
+    'ℹ️ Caawimaadda American Somali Films\n\n' +
+    'Haddii aad cabasho, su\'aal ama dhibaato qabto, fadlan nagala soo xiriir:\n\n' +
+    '📩 Telegram: @Fare252\n\n' +
+    '📱 WhatsApp: +2520906949873\n\n' +
+    'Mahadsanid inaad isticmaasho SOMALI BOT ❤️'
   );
 });
 
@@ -1936,7 +1979,6 @@ bot.command('stats', async ctx => {
     now.getDate()
   );
 
-  // Monthly active users: lastActiveAt in this month.
   const monthlyActive = users.filter(user => {
     if (!user.lastActiveAt) return false;
 
@@ -1988,9 +2030,7 @@ bot.command('stats', async ctx => {
   );
 
   const sourceStats = getSourceStatistics();
-
   const totalReferrals = getTotalReferrals();
-
   const top = getTopReferrers(5);
 
   let topText = '';
@@ -2025,8 +2065,8 @@ bot.command('stats', async ctx => {
     '📸 Instagram: ' + sourceStats.instagram + '\n' +
     '▶️ YouTube: ' + sourceStats.youtube + '\n' +
     '🔗 Referral links: ' + sourceStats.referral + '\n' +
-    '❔ Other / Unknown: ' + sourceStats.other + '\n' +
-    '❔ Older users without source: ' + sourceStats.unknown + '\n\n' +
+    '❔ Other: ' + sourceStats.other + '\n' +
+    '❔ Unknown / Older users: ' + sourceStats.unknown + '\n\n' +
 
     '🏆 TOP REFERRERS\n' + topText + '\n' +
 
@@ -2050,19 +2090,39 @@ bot.command('stats', async ctx => {
 
 
 // =====================================================
-// 27. TELEGRAM MENU - ADMIN ONLY
+// 27. TELEGRAM MENU
 // =====================================================
 
 async function setupTelegramMenu() {
   try {
-    // Remove default command menu for ordinary users.
-    await bot.telegram.setMyCommands([], {
-      scope: {
-        type: 'default'
+    // Commands visible to ordinary users.
+    await bot.telegram.setMyCommands(
+      [
+        {
+          command: 'help',
+          description: 'Caawimaad iyo Support'
+        },
+        {
+          command: 'favorites',
+          description: 'Filimada aad kaydsatay'
+        },
+        {
+          command: 'invite',
+          description: 'Hel referral link-gaaga'
+        },
+        {
+          command: 'top',
+          description: 'Top referrers'
+        }
+      ],
+      {
+        scope: {
+          type: 'default'
+        }
       }
-    });
+    );
 
-    // Only the admin gets these commands in the menu.
+    // Admin-only commands.
     await bot.telegram.setMyCommands(
       [
         {
@@ -2072,6 +2132,10 @@ async function setupTelegramMenu() {
         {
           command: 'broadcast',
           description: 'Send a broadcast'
+        },
+        {
+          command: 'promolinks',
+          description: 'Get traffic promotion links'
         }
       ],
       {
@@ -2082,7 +2146,7 @@ async function setupTelegramMenu() {
       }
     );
 
-    console.log('Telegram Menu configured: Admin only.');
+    console.log('Telegram Menu configured.');
 
   } catch (error) {
     console.error('MENU SETUP ERROR:', error.message);
