@@ -18,6 +18,7 @@ const BOT_TOKEN =
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
 const ADMIN_ID = 7199419196;
+const BOT_USERNAME = 'AmericanFilms252bot';
 
 const CHANNELS = [
   {
@@ -28,6 +29,16 @@ const CHANNELS = [
     username: '@somalifilm0',
     link: 'https://t.me/somalifilm0'
   }
+];
+
+const SOURCES = [
+  'tiktok',
+  'facebook',
+  'telegram',
+  'instagram',
+  'youtube',
+  'other',
+  'referral'
 ];
 
 if (!BOT_TOKEN) {
@@ -101,7 +112,8 @@ let users = loadArray(USERS_DB, 'users')
       firstSeen: user.firstSeen || null,
       favorites: Array.isArray(user.favorites)
         ? user.favorites
-        : []
+        : [],
+      referralCount: Number(user.referralCount) || 0
     };
   })
   .filter(user => Number.isFinite(user.id));
@@ -130,7 +142,11 @@ function getOrCreateUser(userId) {
     user = {
       id: Number(userId),
       firstSeen: new Date().toISOString(),
-      favorites: []
+      lastActiveAt: new Date().toISOString(),
+      favorites: [],
+      referralCount: 0,
+      referredBy: null,
+      firstSource: 'unknown'
     };
 
     users.push(user);
@@ -142,7 +158,164 @@ function getOrCreateUser(userId) {
 
 
 // =====================================================
-// 3. TITLE NORMALIZATION
+// 3. REFERRAL + TRAFFIC TRACKING
+// =====================================================
+
+function getReferralLink(userId) {
+  return `https://t.me/${BOT_USERNAME}?start=ref_${userId}`;
+}
+
+function getSourceLink(source) {
+  return `https://t.me/${BOT_USERNAME}?start=src_${source}`;
+}
+
+function getStartPayload(ctx) {
+  const text = ctx.message?.text || '';
+
+  const match = text.match(/^\/start(?:@\w+)?(?:\s+([^\s]+))?/i);
+
+  return match?.[1] || '';
+}
+
+function validSource(source) {
+  return SOURCES.includes(source)
+    ? source
+    : 'other';
+}
+
+function processNewReferral(user, payload) {
+  if (!payload || user.referredBy || user.firstSource) {
+    return;
+  }
+
+  let source = 'unknown';
+  let inviterId = null;
+
+  const referralMatch = payload.match(
+    /^ref_(\d+)(?:_src_(tiktok|facebook|telegram|instagram|youtube|other))?$/i
+  );
+
+  const sourceMatch = payload.match(
+    /^src_(tiktok|facebook|telegram|instagram|youtube|other)$/i
+  );
+
+  if (referralMatch) {
+    inviterId = Number(referralMatch[1]);
+
+    source = referralMatch[2]
+      ? validSource(referralMatch[2].toLowerCase())
+      : 'referral';
+
+    if (inviterId === Number(user.id)) {
+      inviterId = null;
+    }
+
+    const inviter = inviterId
+      ? getUser(inviterId)
+      : null;
+
+    if (!inviter) {
+      inviterId = null;
+    }
+  } else if (sourceMatch) {
+    source = validSource(
+      sourceMatch[1].toLowerCase()
+    );
+  }
+
+  user.firstSource = source;
+
+  if (inviterId) {
+    user.referredBy = inviterId;
+
+    const inviter = getUser(inviterId);
+
+    if (inviter) {
+      inviter.referralCount =
+        (Number(inviter.referralCount) || 0) + 1;
+    }
+  }
+
+  saveUsers();
+}
+
+function getTotalReferrals() {
+  return users.reduce(
+    (sum, user) =>
+      sum + (Number(user.referralCount) || 0),
+    0
+  );
+}
+
+function getSourceStatistics() {
+  const stats = {};
+
+  for (const source of SOURCES) {
+    stats[source] = 0;
+  }
+
+  stats.unknown = 0;
+
+  for (const user of users) {
+    const source = user.firstSource || 'unknown';
+
+    if (stats[source] === undefined) {
+      stats.unknown++;
+    } else {
+      stats[source]++;
+    }
+  }
+
+  return stats;
+}
+
+function getTopReferrers(limit = 10) {
+  return users
+    .filter(user =>
+      Number(user.referralCount) > 0
+    )
+    .sort((a, b) =>
+      Number(b.referralCount) -
+      Number(a.referralCount)
+    )
+    .slice(0, limit);
+}
+
+
+// =====================================================
+// 4. USER ACTIVITY TRACKING
+// =====================================================
+
+bot.use(async (ctx, next) => {
+  if (ctx.chat?.type === 'private' && ctx.from) {
+    const existing = getUser(ctx.from.id);
+
+    ctx.state.isNewUser = !existing;
+
+    const user = getOrCreateUser(ctx.from.id);
+
+    const now = new Date();
+    const last = user.lastActiveAt
+      ? new Date(user.lastActiveAt)
+      : null;
+
+    // Save activity at most once per hour.
+    if (
+      !last ||
+      !Number.isFinite(last.getTime()) ||
+      now.getTime() - last.getTime() >= 60 * 60 * 1000
+    ) {
+      user.lastActiveAt = now.toISOString();
+      saveUsers();
+    }
+  }
+
+  return next();
+});
+
+
+// =====================================================
+// 5. TITLE NORMALIZATION
 // =====================================================
 
 function normalize(value) {
@@ -171,8 +344,6 @@ function cleanTitle(value) {
     .trim();
 }
 
-// Common spelling corrections and aliases.
-// Add more names here whenever needed.
 const SEARCH_ALIASES = {
   'money host': 'money heist',
   'mony heist': 'money heist',
@@ -191,7 +362,7 @@ function correctQuery(query) {
 
 
 // =====================================================
-// 4. CAPTION PARSING
+// 6. CAPTION PARSING
 // =====================================================
 
 function parseCaption(caption) {
@@ -357,20 +528,7 @@ function getMovieInfo(movie) {
 
 
 // =====================================================
-// 5. REGISTER USERS
-// =====================================================
-
-bot.use(async (ctx, next) => {
-  if (ctx.chat?.type === 'private' && ctx.from) {
-    getOrCreateUser(ctx.from.id);
-  }
-
-  return next();
-});
-
-
-// =====================================================
-// 6. RECEIVE CHANNEL VIDEOS
+// 7. RECEIVE CHANNEL VIDEOS
 // =====================================================
 
 bot.on('channel_post', ctx => {
@@ -435,7 +593,7 @@ bot.on('channel_post', ctx => {
 
 
 // =====================================================
-// 7. SUBSCRIBE CHECK
+// 8. SUBSCRIBE CHECK
 // =====================================================
 
 async function isJoined(userId) {
@@ -481,7 +639,20 @@ async function showJoin(ctx) {
   );
 }
 
+
+// =====================================================
+// 9. START
+// =====================================================
+
 bot.start(async ctx => {
+  const user = getOrCreateUser(ctx.from.id);
+
+  // Only process referral/source for genuinely new users.
+  if (ctx.state.isNewUser) {
+    const payload = getStartPayload(ctx);
+    processNewReferral(user, payload);
+  }
+
   if (!(await isJoined(ctx.from.id))) {
     return showJoin(ctx);
   }
@@ -508,7 +679,107 @@ bot.action('check_join', async ctx => {
 
 
 // =====================================================
-// 8. SMART SEARCH ENGINE
+// 10. REFERRAL COMMAND
+// =====================================================
+
+bot.command('invite', async ctx => {
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
+
+  const user = getOrCreateUser(ctx.from.id);
+  const link = getReferralLink(ctx.from.id);
+
+  const count = Number(user.referralCount) || 0;
+
+  return ctx.reply(
+    '🔗 YOUR REFERRAL LINK\n\n' +
+    '👤 Link-gaaga gaarka ah:\n' +
+    link + '\n\n' +
+    '👥 Dadka aad keentay: ' + count + '\n\n' +
+    '📢 La wadaag saaxiibbadaa si ay bot-ka ugu soo biiraan.\n' +
+    '🎁 Dhibco iyo abaalmarin ma jiraan; tirinta keliya ayaa la sameeyaa.',
+    Markup.inlineKeyboard([
+      [
+        Markup.button.url(
+          '📤 Share Bot',
+          'https://t.me/share/url?url=' +
+          encodeURIComponent(link) +
+          '&text=' +
+          encodeURIComponent('Ku soo biir American Somali Films 🎬')
+        )
+      ]
+    ])
+  );
+});
+
+
+// =====================================================
+// 11. TOP REFERRERS
+// =====================================================
+
+bot.command('top', async ctx => {
+  if (!(await isJoined(ctx.from.id))) {
+    return showJoin(ctx);
+  }
+
+  const top = getTopReferrers(10);
+
+  if (!top.length) {
+    return ctx.reply(
+      '🏆 Weli ma jiraan referrals la diiwaangeliyay.'
+    );
+  }
+
+  let message = '🏆 TOP REFERRERS\n\n';
+
+  top.forEach((user, index) => {
+    const name = user.firstName ||
+      user.username ||
+      `User ${user.id}`;
+
+    message +=
+      `${index + 1}. ${name}\n` +
+      `👥 Referrals: ${user.referralCount}\n\n`;
+  });
+
+  return ctx.reply(message);
+});
+
+
+// =====================================================
+// 12. ADMIN PROMOTION LINKS
+// =====================================================
+
+bot.command('promolinks', async ctx => {
+  if (Number(ctx.from.id) !== ADMIN_ID) {
+    return ctx.reply('❌ Admin keliya.');
+  }
+
+  let message = '🌍 TRAFFIC TRACKING LINKS\n\n';
+
+  for (const source of [
+    'tiktok',
+    'facebook',
+    'telegram',
+    'instagram',
+    'youtube',
+    'other'
+  ]) {
+    message +=
+      source.toUpperCase() + ':\n' +
+      getSourceLink(source) + '\n\n';
+  }
+
+  message +=
+    'Isticmaal link-ga platform-ka aad xayeysiinta ku daabacayso.';
+
+  return ctx.reply(message);
+});
+
+
+// =====================================================
+// 13. SMART SEARCH ENGINE
 // =====================================================
 
 function levenshtein(a, b) {
@@ -539,7 +810,6 @@ function levenshtein(a, b) {
 
 function wordSimilarity(a, b) {
   if (a === b) return 1;
-
   if (!a || !b) return 0;
 
   const distance = levenshtein(a, b);
@@ -752,7 +1022,7 @@ function findMovies(query) {
 
 
 // =====================================================
-// 9. TMDB POSTER AND INFORMATION
+// 14. TMDB POSTER AND INFORMATION
 // =====================================================
 
 const GENRES = {
@@ -906,7 +1176,7 @@ async function sendPosterMenu(
 
 
 // =====================================================
-// 10. SEND VIDEO
+// 15. SEND VIDEO
 // =====================================================
 
 async function sendVideo(ctx, record, groupTitle) {
@@ -950,12 +1220,11 @@ async function sendVideo(ctx, record, groupTitle) {
 
 
 // =====================================================
-// 11. FAVORITES
+// 16. FAVORITES
 // =====================================================
 
 function isFavorite(userId, key) {
   const user = getOrCreateUser(userId);
-
   return user.favorites.includes(key);
 }
 
@@ -1070,7 +1339,7 @@ bot.action(/^favorite:open:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 12. OPEN TITLE / SEASON / EPISODE
+// 17. OPEN TITLE / SEASON / EPISODE
 // =====================================================
 
 async function openGroup(ctx, group, requested = {}) {
@@ -1201,7 +1470,7 @@ async function openGroup(ctx, group, requested = {}) {
 
 
 // =====================================================
-// 13. TEXT SEARCH - SMART DIRECT MATCH
+// 18. TEXT SEARCH
 // =====================================================
 
 bot.on('text', async ctx => {
@@ -1244,7 +1513,6 @@ bot.on('text', async ctx => {
     return openGroup(ctx, best, parsed);
   }
 
-  // Ambiguous results: send individual posters.
   sessions.set(ctx.from.id, {
     type: 'titles',
     groups: results,
@@ -1302,7 +1570,7 @@ bot.on('text', async ctx => {
 
 
 // =====================================================
-// 14. TITLE BUTTON
+// 19. TITLE BUTTON
 // =====================================================
 
 bot.action(/^title:(\d+)$/, async ctx => {
@@ -1331,7 +1599,7 @@ bot.action(/^title:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 15. MOVIE BUTTON
+// 20. MOVIE BUTTON
 // =====================================================
 
 bot.action(/^movie:(\d+)$/, async ctx => {
@@ -1373,7 +1641,7 @@ bot.action(/^movie:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 16. SEASON BUTTON
+// 21. SEASON BUTTON
 // =====================================================
 
 bot.action(/^season:(\d+)$/, async ctx => {
@@ -1430,7 +1698,7 @@ bot.action(/^season:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 17. EPISODE BUTTON
+// 22. EPISODE BUTTON
 // =====================================================
 
 bot.action(/^episode:(\d+)$/, async ctx => {
@@ -1461,7 +1729,7 @@ bot.action(/^episode:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 18. PART BUTTON
+// 23. PART BUTTON
 // =====================================================
 
 bot.action(/^part:(\d+)$/, async ctx => {
@@ -1488,7 +1756,7 @@ bot.action(/^part:(\d+)$/, async ctx => {
 
 
 // =====================================================
-// 19. HELP
+// 24. HELP
 // =====================================================
 
 bot.command('help', async ctx => {
@@ -1496,6 +1764,8 @@ bot.command('help', async ctx => {
     '🎬 AMERICAN SOMALI FILMS\n\n' +
     '🔎 Qor magaca filimka si aad u raadiso.\n' +
     '⭐ /favorites - Filimada aad kaydsatay.\n' +
+    '🔗 /invite - Referral link-gaaga.\n' +
+    '🏆 /top - Dadka referrals-ka ugu badan keenay.\n' +
     'ℹ️ /help - Caawimaad.\n\n' +
     'Haddii aad qalad ku qorto magaca, bot-ku wuxuu isku dayayaa inuu fahmo.'
   );
@@ -1503,7 +1773,7 @@ bot.command('help', async ctx => {
 
 
 // =====================================================
-// 20. ADMIN BROADCAST
+// 25. ADMIN BROADCAST
 // =====================================================
 
 async function broadcastMessage(ctx, messageId) {
@@ -1643,7 +1913,7 @@ bot.action('broadcast_no', async ctx => {
 
 
 // =====================================================
-// 21. ADMIN STATS
+// 26. ADMIN STATISTICS
 // =====================================================
 
 bot.command('stats', async ctx => {
@@ -1652,66 +1922,176 @@ bot.command('stats', async ctx => {
   }
 
   const groups = buildGroups();
-
   const now = new Date();
 
-  const today = users.filter(user => {
-    if (!user.firstSeen) return false;
+  const monthStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    1
+  );
 
-    const date = new Date(user.firstSeen);
+  const todayStart = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate()
+  );
 
-    return date.toDateString() === now.toDateString();
+  // Monthly active users: lastActiveAt in this month.
+  const monthlyActive = users.filter(user => {
+    if (!user.lastActiveAt) return false;
+
+    const date = new Date(user.lastActiveAt);
+
+    return (
+      Number.isFinite(date.getTime()) &&
+      date >= monthStart
+    );
   }).length;
 
-  const lastMonth = users.filter(user => {
+  const activeToday = users.filter(user => {
+    if (!user.lastActiveAt) return false;
+
+    const date = new Date(user.lastActiveAt);
+
+    return (
+      Number.isFinite(date.getTime()) &&
+      date >= todayStart
+    );
+  }).length;
+
+  const joinedToday = users.filter(user => {
     if (!user.firstSeen) return false;
 
     const date = new Date(user.firstSeen);
 
     return (
-      date.getMonth() === now.getMonth() - 1 &&
-      date.getFullYear() === (
-        now.getMonth() === 0
-          ? now.getFullYear() - 1
-          : now.getFullYear()
-      )
+      Number.isFinite(date.getTime()) &&
+      date >= todayStart
+    );
+  }).length;
+
+  const joinedThisMonth = users.filter(user => {
+    if (!user.firstSeen) return false;
+
+    const date = new Date(user.firstSeen);
+
+    return (
+      Number.isFinite(date.getTime()) &&
+      date >= monthStart
     );
   }).length;
 
   const totalFavorites = users.reduce(
-    (sum, user) => sum + (user.favorites || []).length,
+    (sum, user) =>
+      sum + (user.favorites || []).length,
     0
   );
 
-  return ctx.reply(
-    '📊 AMERICAN SOMALI FILMS\n\n' +
+  const sourceStats = getSourceStatistics();
+
+  const totalReferrals = getTotalReferrals();
+
+  const top = getTopReferrers(5);
+
+  let topText = '';
+
+  if (top.length) {
+    top.forEach((user, index) => {
+      topText +=
+        `${index + 1}. ${user.firstName || user.username || user.id}` +
+        ` — ${user.referralCount}\n`;
+    });
+  } else {
+    topText = 'Weli referrals ma jiraan.\n';
+  }
+
+  const message =
+    '📊 AMERICAN SOMALI FILMS\n' +
+    '━━━━━━━━━━━━━━━━━━\n\n' +
 
     '👥 ALL TIME USERS: ' + users.length + '\n' +
-    '🆕 USERS TODAY: ' + today + '\n' +
-    '📅 USERS LAST MONTH: ' + lastMonth + '\n\n' +
+    '📅 MONTHLY ACTIVE USERS: ' + monthlyActive + '\n' +
+    '🆕 USERS JOINED THIS MONTH: ' + joinedThisMonth + '\n' +
+    '☀️ ACTIVE TODAY: ' + activeToday + '\n' +
+    '🆕 JOINED TODAY: ' + joinedToday + '\n\n' +
 
-    '🎬 VIDEO RECORDS: ' + movies.length + '\n' +
+    '🔗 REFERRAL STATISTICS\n' +
+    '👥 TOTAL REFERRALS: ' + totalReferrals + '\n\n' +
+
+    '🌍 TRAFFIC SOURCES\n' +
+    '🎵 TikTok: ' + sourceStats.tiktok + '\n' +
+    '📘 Facebook: ' + sourceStats.facebook + '\n' +
+    '✈️ Telegram: ' + sourceStats.telegram + '\n' +
+    '📸 Instagram: ' + sourceStats.instagram + '\n' +
+    '▶️ YouTube: ' + sourceStats.youtube + '\n' +
+    '🔗 Referral links: ' + sourceStats.referral + '\n' +
+    '❔ Other / Unknown: ' + sourceStats.other + '\n' +
+    '❔ Older users without source: ' + sourceStats.unknown + '\n\n' +
+
+    '🏆 TOP REFERRERS\n' + topText + '\n' +
+
+    '🎬 MOVIE STATISTICS\n' +
+    '🎞️ VIDEO RECORDS: ' + movies.length + '\n' +
     '📚 FILM / SERIES GROUPS: ' + groups.length + '\n' +
-
     '📺 SERIES: ' +
     groups.filter(g => g.kind === 'series').length + '\n' +
-
     '🎞️ FILMS WITH PARTS: ' +
     groups.filter(g => g.kind === 'parts').length + '\n' +
-
     '🎬 SINGLE MOVIES: ' +
     groups.filter(g => g.kind === 'movie').length + '\n\n' +
 
     '❤️ FAVORITES SAVED: ' + totalFavorites + '\n' +
 
     '🖼️ TMDB: ' +
-    (TMDB_API_KEY ? 'Enabled' : 'API key missing')
-  );
+    (TMDB_API_KEY ? 'Enabled' : 'API key missing');
+
+  return ctx.reply(message);
 });
 
 
 // =====================================================
-// 22. ERROR HANDLING / STARTUP
+// 27. TELEGRAM MENU - ADMIN ONLY
+// =====================================================
+
+async function setupTelegramMenu() {
+  try {
+    // Remove default command menu for ordinary users.
+    await bot.telegram.setMyCommands([], {
+      scope: {
+        type: 'default'
+      }
+    });
+
+    // Only the admin gets these commands in the menu.
+    await bot.telegram.setMyCommands(
+      [
+        {
+          command: 'stats',
+          description: 'View bot statistics'
+        },
+        {
+          command: 'broadcast',
+          description: 'Send a broadcast'
+        }
+      ],
+      {
+        scope: {
+          type: 'chat',
+          chat_id: ADMIN_ID
+        }
+      }
+    );
+
+    console.log('Telegram Menu configured: Admin only.');
+
+  } catch (error) {
+    console.error('MENU SETUP ERROR:', error.message);
+  }
+}
+
+
+// =====================================================
+// 28. ERROR HANDLING / STARTUP
 // =====================================================
 
 bot.catch(error => {
@@ -1725,14 +2105,20 @@ bot.launch({
     'channel_post'
   ]
 })
-  .then(() => {
+  .then(async () => {
     console.log('American Somali Films Bot is running!');
     console.log('Smart Search: Enabled');
     console.log('TMDB Posters:', TMDB_API_KEY ? 'Enabled' : 'Missing');
     console.log('Series: Poster -> Seasons -> Episodes -> Video');
     console.log('Favorites: Enabled');
-    console.log('Stats: Enabled');
+    console.log('Referral Tracking: Enabled');
+    console.log('Traffic Tracking: Enabled');
+    console.log('Monthly Active Users: Enabled');
+    console.log('Admin Stats: Enabled');
+    console.log('Admin Menu: Enabled');
     console.log('Old movies.json and users.json preserved.');
+
+    await setupTelegramMenu();
   })
   .catch(error => {
     console.error('BOT LAUNCH ERROR:', error);
